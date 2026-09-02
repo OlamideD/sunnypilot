@@ -66,6 +66,8 @@ class UIStateSP:
     self._sp_initialized: bool = False
 
   def update(self) -> None:
+    self.chestnut_present = self.chestnut_present or self.sm["deviceState"].chestnutPresent
+
     if self.sunnylink_enabled:
       self.sunnylink_state.start()
     else:
