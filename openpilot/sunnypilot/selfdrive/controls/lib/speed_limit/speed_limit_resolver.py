@@ -15,10 +15,90 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD, get_sanitize_int_param
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import LIMIT_MAX_MAP_DATA_AGE, LIMIT_ADAPT_ACC
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Policy, OffsetType
+import json
+import os
+
+# SPRINT20H_LIMIT_BRACKETS: {"brackets": [[limitKphUpTo, offsetKph], ...]} sorted ascending; the first bracket whose
+# upper bound is >= the posted limit applies. Example: [[40, 0], [60, 5], [80, 8], [200, 10]].
+SONATA_LIMIT_OFFSETS = "/data/sonata_speed_limit_offsets.json"
+_sonata_brackets = {"mtime": None, "check": 0.0, "rows": None}
+
+
+def sonata_bracket_offset_kph(speed_limit_ms):
+  now = time.monotonic()
+  if now - _sonata_brackets["check"] >= 2.0:
+    _sonata_brackets["check"] = now
+    try:
+      st = os.stat(SONATA_LIMIT_OFFSETS)
+      if st.st_mtime != _sonata_brackets["mtime"]:
+        _sonata_brackets["mtime"] = st.st_mtime
+        with open(SONATA_LIMIT_OFFSETS) as f:
+          obj = json.load(f)
+        rows = obj.get("brackets") if isinstance(obj, dict) else None
+        _sonata_brackets["rows"] = sorted(((float(a), float(b)) for a, b in rows), key=lambda r: r[0]) if isinstance(rows, list) and rows else None
+    except Exception:
+      _sonata_brackets["rows"] = None
+  rows = _sonata_brackets["rows"]
+  if not rows or not speed_limit_ms or speed_limit_ms <= 0:
+    return None
+  kph = float(speed_limit_ms) * CV.MS_TO_KPH
+  for upper, offset in rows:
+    if kph <= upper + 0.5:
+      return max(-20.0, min(20.0, offset))
+  return max(-20.0, min(20.0, rows[-1][1]))
 
 SpeedLimitSource = custom.LongitudinalPlanSP.SpeedLimit.Source
 
 ALL_SOURCES = tuple(SpeedLimitSource.schema.enumerants.values())
+
+
+
+import json  # SPRINT23E_ROAD_LIMIT
+import os
+
+# SPRINT23E_ROAD_LIMIT: guidance publishes the nearest OSM way's maxspeed (or a class default) in route_guidance_state.json
+# ("roadLimit"); it stands in for the map source when mapd reports nothing (#190: five streets at 0).
+SONATA_ROAD_LIMIT_STATE = "/data/sonata_drive10_lab/route_guidance_state.json"
+SONATA_ROAD_LIMIT_STALE_S = 45.0
+
+
+class SonataRoadLimit:
+  def __init__(self, path=SONATA_ROAD_LIMIT_STATE):
+    self.path = path
+    self._mtime = None
+    self._check = 0.0
+    self.kph = None
+    self.info = None
+
+  def value_ms(self, road_name: str = "") -> float:   # SPRINT23B_ROAD_LIMIT_V2: prefer the candidate named like mapd's road
+    now = time.monotonic()
+    if now - self._check >= 1.0:
+      self._check = now
+      try:
+        st = os.stat(self.path)
+        if st.st_mtime != self._mtime:
+          self._mtime = st.st_mtime
+          with open(self.path) as f:
+            s = json.load(f)
+          rl = s.get("roadLimit") if isinstance(s, dict) else None
+          self.info = rl if isinstance(rl, dict) else None
+          self.kph = rl.get("kph") if isinstance(rl, dict) and isinstance(rl.get("kph"), (int, float)) else None
+          self._cands = rl.get("candidates") if isinstance(rl, dict) and isinstance(rl.get("candidates"), list) else []
+        if time.time() - st.st_mtime > SONATA_ROAD_LIMIT_STALE_S:
+          self.kph = None
+      except Exception:
+        self.kph, self.info, self._cands = None, None, []
+    kph = self.kph
+    rn = str(road_name or "").strip().lower()
+    if rn and self.kph is not None or rn and getattr(self, "_cands", None):
+      for c in getattr(self, "_cands", []) or []:
+        if isinstance(c, dict) and str(c.get("name") or "").strip().lower() == rn:
+          kph = c.get("kph") if isinstance(c.get("kph"), (int, float)) else None
+          break
+    return float(kph) / 3.6 if kph else 0.0
+
+
+sonata_road_limit = SonataRoadLimit()
 
 
 class SpeedLimitResolver:
@@ -100,6 +180,10 @@ class SpeedLimitResolver:
     if self.offset_type == OffsetType.off:
       return 0
     elif self.offset_type == OffsetType.fixed:
+      # SPRINT20H_LIMIT_BRACKETS: per-bracket offsets from /data/sonata_speed_limit_offsets.json when present.
+      bracket = sonata_bracket_offset_kph(self.speed_limit)
+      if bracket is not None:
+        return float(bracket * CV.KPH_TO_MS)
       return float(self.offset_value * (CV.KPH_TO_MS if self.is_metric else CV.MPH_TO_MS))
     elif self.offset_type == OffsetType.percentage:
       return float(self.offset_value * 0.01 * self.speed_limit)
@@ -171,6 +255,11 @@ class SpeedLimitResolver:
     """Get limit solutions from each data source"""
     self._get_from_car_state(sm)
     self._get_from_map_data(sm)
+    if self.limit_solutions[SpeedLimitSource.map] <= 0.:   # SPRINT23E_ROAD_LIMIT: OSM way limit / class default as the map source
+      _rl = sonata_road_limit.value_ms(sm['liveMapDataSP'].roadName if sm.valid['liveMapDataSP'] or sm.updated['liveMapDataSP'] else "")
+      if _rl > 0.:
+        self.limit_solutions[SpeedLimitSource.map] = _rl
+        self.distance_solutions[SpeedLimitSource.map] = 0.
 
     source = self._get_source_solution_according_to_policy()
     speed_limit = self.limit_solutions[source] if source else 0.

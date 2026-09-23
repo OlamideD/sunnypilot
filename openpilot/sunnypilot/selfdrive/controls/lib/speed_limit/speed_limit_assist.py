@@ -93,6 +93,11 @@ class SpeedLimitAssist:
     self._minus_hold = 0.
     self._release_toggle_prev = 0
 
+    # SONATA_PROJECT_DRIVER_SPEED_OVERRIDE
+    # A manual SET/RES cruise-speed change after engagement suspends SLA for the
+    # remainder of that longitudinal engagement. It resets on disengagement.
+    self._driver_speed_override = False
+
     # TODO-SP: SLA's own output_a_target for planner
     # Solution functions mapped to respective states
     self.acceleration_solutions = {
@@ -122,7 +127,9 @@ class SpeedLimitAssist:
 
   def update_active_event(self, events_sp: EventsSP) -> None:
     if self.v_cruise_cluster_below_confirm_speed_threshold:
-      events_sp.add(EventNameSP.speedLimitChanged)
+      # SPRINT26D_SLA_QUIET (owner 2026-09-10): the set speed still changes; the announcement is off unless the flag exists
+      if __import__('os').path.exists('/data/sonata_sla_alert_on'):
+        events_sp.add(EventNameSP.speedLimitChanged)
     else:
       events_sp.add(EventNameSP.speedLimitActive)
 
@@ -229,6 +236,15 @@ class SpeedLimitAssist:
     if self.state != SpeedLimitAssistState.preActive:
       return False
 
+    # SONATA_PROJECT_AUTO_SPEED_ACCEPT
+    # Project-specific behavior for the validated 2024-26 non-HDA2 ccNC Sonata.
+    # A valid SLA target is accepted automatically once SLA reaches preActive.
+    # The planner still takes min(cruise, SCC vision, SCC map, SLA), so the
+    # driver's normal cruise set speed remains an upper bound unless the driver
+    # explicitly invokes the per-engagement SLA override below.
+    if str(self.CP.carFingerprint) == "HYUNDAI_SONATA_2024" and self._has_speed_limit:
+      return True
+
     req_plus, req_minus = compare_cluster_target(self.v_cruise_cluster, self._speed_limit_final_last, self.is_metric)
 
     return self._get_button_release(req_plus, req_minus)
@@ -241,6 +257,9 @@ class SpeedLimitAssist:
     if self.state != SpeedLimitAssistState.disabled:
       if not self.long_enabled or not self.enabled:
         self.state = SpeedLimitAssistState.disabled
+
+      elif self._driver_speed_override:
+        self.state = SpeedLimitAssistState.inactive
 
       else:
         # ACTIVE
@@ -286,8 +305,11 @@ class SpeedLimitAssist:
     # DISABLED
     elif self.state == SpeedLimitAssistState.disabled:
       if self.long_enabled and self.enabled:
+        if self._driver_speed_override:
+          self.state = SpeedLimitAssistState.inactive
+
         # start or reset preActive timer if initially enabled or manual set speed change detected
-        if not self.long_enabled_prev or self.v_cruise_cluster_changed:
+        elif not self.long_enabled_prev or self.v_cruise_cluster_changed:
           self.long_engaged_timer = int(DISABLED_GUARD_PERIOD / DT_MDL)
 
         elif self.long_engaged_timer <= 0:
@@ -308,10 +330,31 @@ class SpeedLimitAssist:
     self.long_engaged_timer = max(0, self.long_engaged_timer - 1)
     self.pre_active_timer = max(0, self.pre_active_timer - 1)
 
+    # SONATA_PROJECT_DRIVER_SPEED_OVERRIDE
+    # Reset the override when longitudinal control fully disengages. Once already
+    # engaged, any manual cruise set-speed change takes priority over SLA until
+    # the next engagement. This does not disable Smart Cruise Map/Vision.
+    if not self.long_enabled:
+      self._driver_speed_override = False
+    elif self.long_enabled_prev and self.v_cruise_cluster_changed:
+      self._driver_speed_override = True
+    # SPRINT33N_SLA_RESUMES_AT_A_NEW_LIMIT: the 31n override suspended SLA for the WHOLE engagement.
+    # Drive #277 measured the cost: 8 active rows in 40,221, because 36 manual set-speed changes kept
+    # it suspended end to end. The driver's set speed still wins on the road where it was set; a
+    # genuinely new limit (speed_limit_changed = a different limit value) re-offers SLA on the next
+    # road. Evaluated after the manual-change clause so a change in the same frame still suspends.
+    elif self._driver_speed_override and self.speed_limit_changed:
+      self._driver_speed_override = False
+
     # ACTIVE, ADAPTING, PENDING, PRE_ACTIVE, INACTIVE
     if self.state != SpeedLimitAssistState.disabled:
       if not self.long_enabled or not self.enabled:
         self.state = SpeedLimitAssistState.disabled
+
+      elif self._driver_speed_override:   # SPRINT31N_OVERRIDE_HONOURED: the flag was set here and read only in the
+        # pcm_op_long machine, which never runs on this car - so the driver's SET/RES was always
+        # overridden again by the INACTIVE branch re-arming. Mirrors pcm_op_long line 261.
+        self.state = SpeedLimitAssistState.inactive
 
       else:
         # ACTIVE
@@ -342,8 +385,11 @@ class SpeedLimitAssist:
     # DISABLED
     elif self.state == SpeedLimitAssistState.disabled:
       if self.long_enabled and self.enabled:
+        if self._driver_speed_override:   # SPRINT31N_OVERRIDE_HONOURED: mirrors pcm_op_long line 308
+          self.state = SpeedLimitAssistState.inactive
+
         # start or reset preActive timer if initially enabled or manual set speed change detected
-        if not self.long_enabled_prev or self.v_cruise_cluster_changed:
+        elif not self.long_enabled_prev or self.v_cruise_cluster_changed:
           self.long_engaged_timer = int(DISABLED_GUARD_PERIOD / DT_MDL)
 
         elif self.long_engaged_timer <= 0:

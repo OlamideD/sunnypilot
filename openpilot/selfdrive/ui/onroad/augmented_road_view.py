@@ -10,6 +10,21 @@ from openpilot.selfdrive.ui.onroad.hud_renderer import HudRenderer
 from openpilot.selfdrive.ui.onroad.model_renderer import ModelRenderer
 from openpilot.selfdrive.ui.onroad.cameraview import CameraView
 from openpilot.system.ui.lib.application import gui_app
+import os as _sonata_os
+import time as _sonata_time
+
+# SPRINT17D_TESLA_VIEW: camera-less onroad view. The flag file is checked every 2 s so the camera
+# can be restored live by deleting it. Nothing here touches driving or driver monitoring.
+SONATA_TESLA_VIEW_FLAG = "/data/sonata_ui_tesla_view"
+_sonata_tesla_cache = {"t": 0.0, "on": False}
+
+
+def sonata_tesla_view() -> bool:
+  now = _sonata_time.monotonic()
+  if now - _sonata_tesla_cache["t"] > 2.0:
+    _sonata_tesla_cache["t"] = now
+    _sonata_tesla_cache["on"] = _sonata_os.path.exists(SONATA_TESLA_VIEW_FLAG)
+  return _sonata_tesla_cache["on"]
 from openpilot.common.transformations.camera import DEVICE_CAMERAS, DeviceCameraConfig, view_frame_from_device_frame
 from openpilot.common.transformations.orientation import rot_from_euler
 
@@ -84,8 +99,12 @@ class AugmentedRoadView(CameraView, AugmentedRoadViewSP):
       int(self._content_rect.height)
     )
 
-    # Render the base camera view
-    super()._render(self._content_rect)
+    # Render the base camera view (SPRINT17D_TESLA_VIEW: or a dark ground with no camera texture)
+    if sonata_tesla_view():
+      self._calc_frame_matrix(self._content_rect)  # keeps the model-space transform current
+      rl.draw_rectangle_rec(self._content_rect, rl.Color(10, 12, 16, 255))
+    else:
+      super()._render(self._content_rect)
 
     # Draw all UI overlays
     self.model_renderer.render(self._content_rect)

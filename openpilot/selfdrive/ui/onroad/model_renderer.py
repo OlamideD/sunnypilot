@@ -1,4 +1,7 @@
 import colorsys
+import json
+import time
+from pathlib import Path
 import numpy as np
 import pyray as rl
 from openpilot.cereal import messaging
@@ -64,6 +67,27 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
     self._lane_lines = [ModelPoints() for _ in range(4)]
     self._road_edges = [ModelPoints() for _ in range(2)]
     self._acceleration_x = np.empty((0,), dtype=np.float32)
+    self._sonata_scene = {}
+    self._sonata_scene_read = 0.0
+    self._sonata_scene_path = Path('/data/sonata_telemetry/live_scene.json')
+    # SPRINT16D_MANEUVER_HUD: advisory route guidance state (next maneuver + distance).
+    self._sonata_route = {}
+    self._sonata_route_read = 0.0
+    self._sonata_route_path = Path('/data/sonata_drive10_lab/route_guidance_state.json')
+    # SPRINT19B_RADAR_HUD: passive radar tracks (10 Hz file) and the lane planner (change-driven file).
+    self._sonata_radar = {}
+    self._sonata_radar_read = 0.0
+    self._sonata_radar_mtime = None
+    self._sonata_radar_path = Path('/data/sonata_telemetry/radar_live.json')
+    self._sonata_lane = {}
+    self._sonata_lane_read = 0.0
+    self._sonata_lane_mtime = None
+    self._sonata_lane_path = Path('/data/sonata_telemetry/lane_planner.json')
+    self._sonata_bsm_tint = rl.Color(255, 70, 60, 70)  # SPRINT20E_HUD
+    self._sonata_rx = {}   # SPRINT32D_ROUTE_EXEC_HUD: route executor live state (5 Hz, gone 1.5 s after the daemon stops)
+    self._sonata_rx_read = 0.0
+    self._sonata_rx_mtime = None
+    self._sonata_rx_path = Path('/data/sonata_telemetry/route_exec_live.json')
 
     # Transform matrix (3x3 for car space to screen space)
     self._car_space_transform = np.zeros((3, 3), dtype=np.float32)
@@ -132,6 +156,7 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
         self._update_leads(radar_state, path_x_array)
       self._transform_dirty = False
 
+    self._update_sonata_scene()
     # Draw elements
     self._draw_lane_lines()
     self._draw_path(sm)
@@ -139,6 +164,235 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
     if render_lead_indicator and radar_state:
       self._draw_lead_indicator()
       self.chevron_metrics.draw_lead_status(sm, radar_state, self._rect, self._lead_vehicles)
+
+    self._draw_sonata_scene(rect)
+    self._draw_sonata_pedals(sm)  # SPRINT20E_HUD
+
+    # SONATA_SOURCE_AWARE_SCENE_V1
+    self._draw_sonata_source_scene(sm, radar_state)
+
+  def _update_sonata_scene(self):
+    now = time.monotonic()
+    if now - self._sonata_scene_read < 0.20:
+      return
+    self._sonata_scene_read = now
+    try:
+      obj = json.loads(self._sonata_scene_path.read_text())
+      if not isinstance(obj, dict) or now - float(obj.get("mono", -1e9)) > 1.5:
+        self._sonata_scene = {}
+      else:
+        self._sonata_scene = obj
+    except Exception:
+      self._sonata_scene = {}
+    self._update_sonata_route(now)
+    self._update_sonata_radar(now)
+
+  def _update_sonata_route(self, now):
+    # SPRINT16D_MANEUVER_HUD: <= 2 Hz; the guidance file must be younger than 4 s.
+    if now - self._sonata_route_read < 0.5:
+      return
+    self._sonata_route_read = now
+    try:
+      age = time.time() - self._sonata_route_path.stat().st_mtime
+      obj = json.loads(self._sonata_route_path.read_text())
+      self._sonata_route = obj if (isinstance(obj, dict) and 0.0 <= age <= 4.0) else {}
+    except Exception:
+      self._sonata_route = {}
+
+  def _update_sonata_radar(self, now):
+    # SPRINT19B_RADAR_HUD: parse only when the files changed; radar <= 10 Hz, lane planner <= 5 Hz.
+    if now - self._sonata_radar_read >= 0.1:
+      self._sonata_radar_read = now
+      try:
+        st = self._sonata_radar_path.stat()
+        if st.st_mtime != self._sonata_radar_mtime:
+          self._sonata_radar_mtime = st.st_mtime
+          obj = json.loads(self._sonata_radar_path.read_text())
+          self._sonata_radar = obj if isinstance(obj, dict) else {}
+        if time.time() - st.st_mtime > 1.0:
+          self._sonata_radar = {}
+      except Exception:
+        self._sonata_radar = {}
+    if now - self._sonata_rx_read >= 0.2:   # SPRINT32D_ROUTE_EXEC_HUD
+      self._sonata_rx_read = now
+      try:
+        st = self._sonata_rx_path.stat()
+        if st.st_mtime != self._sonata_rx_mtime:
+          self._sonata_rx_mtime = st.st_mtime
+          obj = json.loads(self._sonata_rx_path.read_text())
+          self._sonata_rx = obj if isinstance(obj, dict) else {}
+        if time.time() - st.st_mtime > 1.5:
+          self._sonata_rx = {}
+      except Exception:
+        self._sonata_rx = {}
+    if now - self._sonata_lane_read >= 0.2:
+      self._sonata_lane_read = now
+      try:
+        st = self._sonata_lane_path.stat()
+        if st.st_mtime != self._sonata_lane_mtime:
+          self._sonata_lane_mtime = st.st_mtime
+          obj = json.loads(self._sonata_lane_path.read_text())
+          self._sonata_lane = obj if isinstance(obj, dict) else {}
+        if time.time() - st.st_mtime > 4.0:
+          self._sonata_lane = {}
+      except Exception:
+        self._sonata_lane = {}
+
+  def _sonata_lane_label(self):
+    lane = self._sonata_lane
+    if not lane or lane.get("mode") == "off":
+      return None, None
+    req = lane.get("request")
+    rec = lane.get("recommendation")
+    if isinstance(req, dict) and req.get("direction") in ("left", "right"):
+      arrow = "<" if req["direction"] == "left" else ">"
+      return f"AUTO LANE {arrow} {req['direction'].upper()}", rl.Color(120, 220, 255, 255)
+    if isinstance(rec, dict) and rec.get("direction") in ("left", "right"):
+      arrow = "<" if rec["direction"] == "left" else ">"
+      reason = str(rec.get("reason") or "").split(" ")[0].upper()[:10]
+      cd = rec.get("countdownS")
+      text = f"LANE {arrow} {rec['direction'].upper()} {reason}"
+      if isinstance(cd, (int, float)) and cd > 0:
+        text += f" {cd:.0f}s"
+      return text, rl.Color(200, 200, 255, 255)
+    return None, None
+
+  def _draw_sonata_radar_tracks(self, path_x):
+    # SPRINT19B_RADAR_HUD: white boxes for measured tracks, grey for coasted; nothing here feeds control.
+    tracks = self._sonata_radar.get("tracks") if self._sonata_radar else None
+    if not tracks:
+      return
+    for t in tracks:
+      try:
+        x = float(t["x"]); y = float(t["y"])
+      except Exception:
+        continue
+      if x <= 1.0 or x > 150.0:
+        continue
+      idx = self._get_path_length_idx(path_x, x)
+      z = self._path.raw_points[idx, 2] if idx < len(self._path.raw_points) else 0.0
+      point = self._map_to_screen(x, y + self._camera_offset, z + self._path_offset_z)
+      if not point:
+        continue
+      size = max(10, min(46, int(1100.0 / x)))
+      measured = t.get("state") == 3
+      moving = t.get("motion") == 2
+      colour = rl.Color(255, 255, 255, 235) if measured else rl.Color(160, 160, 170, 170)
+      rx, ry = int(point[0] - size / 2), int(point[1] - size * 0.8)
+      rl.draw_rectangle_lines_ex(rl.Rectangle(rx, ry, size, int(size * 1.4)), 2 if measured else 1, colour)
+      if moving and measured:
+        rl.draw_rectangle(rx + 2, ry + 2, max(size - 4, 2), 4, rl.Color(120, 220, 255, 230))
+      if t.get("lane") == "ego" and measured:
+        rl.draw_text(f"{x:.0f}", rx, ry - 18, 16, colour)
+
+  def _sonata_route_label(self):
+    route = self._sonata_route
+    status = str(route.get("status") or "")
+    if status == "OFF_ROUTE":
+      return "OFF ROUTE", rl.Color(220, 80, 60, 255)
+    if status != "ACTIVE":
+      return None, None
+    maneuver = route.get("nextManeuver")
+    dist = route.get("nextManeuverDistanceM")
+    # SPRINT18C_SIGNAL_HUD: the next traffic control ahead takes the slot when it is the closer thing.
+    control = route.get("nextTrafficControl")
+    if isinstance(control, dict):
+      c_dist = control.get("distanceM")
+      if isinstance(c_dist, (int, float)) and c_dist <= 120 and (not isinstance(dist, (int, float)) or c_dist < dist):
+        kind = str(control.get("kind") or "")
+        if kind == "stop":
+          return "STOP SIGN " + str(int(c_dist)) + " m", rl.Color(235, 70, 60, 255)
+        if kind == "signal":
+          return "SIGNAL " + str(int(c_dist)) + " m", rl.Color(255, 190, 40, 255)
+    if not maneuver or not isinstance(dist, (int, float)) or dist > 600:
+      # SPRINT16G_ROUTE_ARMED: the route is loaded and armed; show its name until a maneuver is near.
+      name = str(route.get("routeName") or "").strip().upper()
+      return ("ROUTE " + name[:22]) if name else "ROUTE ARMED", rl.Color(120, 200, 140, 255)
+    label = str(maneuver).replace("_", " ").upper() + " " + str(int(dist)) + " m"
+    road = str(route.get("nextRoad") or "").strip().upper()
+    if road:
+      label += " " + road[:18]
+    return label, rl.Color(90, 170, 255, 255)
+
+  def _draw_sonata_scene(self, rect):
+    scene = self._sonata_scene
+    if not scene and not self._sonata_route and not self._sonata_lane and not self._sonata_rx:   # SPRINT32D_ROUTE_EXEC_HUD
+      return
+    signs = []
+    for item in scene.get("roadSigns", []):
+      if not isinstance(item, dict) or not item.get("observed"):
+        continue
+      name = str(item.get("additionalSignName") or item.get("name") or "SIGN").replace("_", " ").upper()
+      if name not in signs:
+        signs.append(name)
+      if len(signs) >= 4:
+        break
+    # SPRINT15A_VISIBLE_BADGES: below the set-speed HUD box (x+60, y+45, h 204), which is
+    # painted after this renderer and previously hid the badges completely.
+    x = int(rect.x + 60)
+    y = int(rect.y + 45 + 204 + 18)
+    for name in signs:
+      label = "OEM " + name[:22]
+      w = max(200, 17 * len(label) + 24)
+      rl.draw_rectangle(x, y, w, 50, rl.Color(18, 18, 18, 205))
+      rl.draw_rectangle_lines_ex(rl.Rectangle(x, y, w, 50), 3, rl.Color(255, 200, 60, 255))
+      rl.draw_text(label, x + 12, y + 10, 30, rl.Color(255, 255, 255, 255))
+      y += 58
+
+    # SPRINT16D_MANEUVER_HUD: next route maneuver below the OEM sign badges.
+    route_label, route_color = self._sonata_route_label()
+    if route_label:
+      w = max(200, 17 * len(route_label) + 24)
+      rl.draw_rectangle(x, y, w, 50, rl.Color(18, 18, 18, 205))
+      rl.draw_rectangle_lines_ex(rl.Rectangle(x, y, w, 50), 3, route_color)
+      rl.draw_text(route_label, x + 12, y + 10, 30, rl.Color(255, 255, 255, 255))
+      y += 58
+    # SPRINT19B_RADAR_HUD: lane planner recommendation / auto request badge.
+    lane_label, lane_color = self._sonata_lane_label()
+    if lane_label:
+      w = max(200, 17 * len(lane_label) + 24)
+      rl.draw_rectangle(x, y, w, 50, rl.Color(18, 18, 18, 205))
+      rl.draw_rectangle_lines_ex(rl.Rectangle(x, y, w, 50), 3, lane_color)
+      rl.draw_text(lane_label, x + 12, y + 10, 30, rl.Color(255, 255, 255, 255))
+      y += 58
+    # SPRINT32D_ROUTE_EXEC_HUD: route executor state; red TAKEOVER is the visible takeover event (DEVICE_HANDOFF S4).
+    rx_label, rx_color = self._sonata_route_exec_label()
+    if rx_label:
+      w = max(200, 17 * len(rx_label) + 24)
+      rl.draw_rectangle(x, y, w, 50, rl.Color(18, 18, 18, 205))
+      rl.draw_rectangle_lines_ex(rl.Rectangle(x, y, w, 50), 3, rx_color)
+      rl.draw_text(rx_label, x + 12, y + 10, 30, rl.Color(255, 255, 255, 255))
+      y += 58
+    # SPRINT20I_LOW_GRIP: badge while the grip monitor reports low grip.
+    grip = (self._sonata_lane or {}).get("grip") if isinstance(self._sonata_lane, dict) else None
+    if isinstance(grip, dict) and grip.get("lowGrip"):
+      grip_label = "LOW GRIP " + str(grip.get("reason") or "").upper()[:16]
+      w = max(200, 17 * len(grip_label) + 24)
+      rl.draw_rectangle(x, y, w, 50, rl.Color(18, 18, 18, 205))
+      rl.draw_rectangle_lines_ex(rl.Rectangle(x, y, w, 50), 3, rl.Color(120, 200, 255, 255))
+      rl.draw_text(grip_label, x + 12, y + 10, 30, rl.Color(255, 255, 255, 255))
+      y += 58
+    # SPRINT20E_HUD: weather badge.
+    weather_label, weather_color = self._sonata_weather_label()
+    if weather_label:
+      w = max(160, 17 * len(weather_label) + 24)
+      rl.draw_rectangle(x, y, w, 50, rl.Color(18, 18, 18, 205))
+      rl.draw_rectangle_lines_ex(rl.Rectangle(x, y, w, 50), 3, weather_color)
+      rl.draw_text(weather_label, x + 12, y + 10, 30, rl.Color(255, 255, 255, 255))
+      y += 58
+
+    vehicles = scene.get("frontCameraVehicles", [])
+    object_count = 0
+    for group in vehicles if isinstance(vehicles, list) else []:
+      if isinstance(group, dict):
+        objects = group.get("objects") or []
+        if isinstance(objects, list):
+          object_count += len(objects)
+    if object_count:
+      label = "OEM VEHICLES " + str(object_count)
+      # Below the top-right buttons (border 30 + button 192) rather than underneath them.
+      rl.draw_rectangle(int(rect.x + rect.width - 30 - 260), int(rect.y + 45 + 204 + 18), 260, 50, rl.Color(30, 80, 150, 205))
+      rl.draw_text(label, int(rect.x + rect.width - 30 - 248), int(rect.y + 45 + 204 + 28), 30, rl.Color(255, 255, 255, 255))
 
   def _update_raw_points(self, model):
     """Update raw 3D points from model data"""
@@ -313,6 +567,125 @@ class ModelRenderer(Widget, ChevronMetrics, ModelRendererSP):
         stops=[0.0, 0.5, 1.0],
       )
       draw_polygon(self._rect, self._path.projected_points, gradient=gradient)
+    # SPRINT20E_HUD: blind-spot tint on the path while the OEM BSM reports a vehicle on either side.
+    try:
+      cs = sm['carState']
+      if cs.leftBlindspot or cs.rightBlindspot:
+        draw_polygon(self._rect, self._path.projected_points, self._sonata_bsm_tint)
+    except Exception:
+      pass
+
+  def _draw_sonata_pedals(self, sm):
+    # SPRINT20E_HUD: gas / brake indicators (FrogPilot "pedals") bottom-right, only while pressed or engaged.
+    try:
+      cs = sm['carState']
+      gas, brake = bool(cs.gasPressed), bool(cs.brakePressed)
+    except Exception:
+      return
+    rect = self._rect
+    x0 = int(rect.x + rect.width - 30 - 2 * 74)
+    y0 = int(rect.y + rect.height - 30 - 54)
+    for i, (label, on, colour) in enumerate((("BRAKE", brake, rl.Color(230, 60, 60, 235)), ("GAS", gas, rl.Color(70, 200, 110, 235)))):
+      x = x0 + i * 74
+      fill = colour if on else rl.Color(30, 30, 30, 150)
+      rl.draw_rectangle(x, y0, 64, 54, fill)
+      rl.draw_rectangle_lines_ex(rl.Rectangle(x, y0, 64, 54), 2, rl.Color(200, 200, 200, 180 if on else 90))
+      rl.draw_text(label, x + 8 if label == "BRAKE" else x + 16, y0 + 17, 18, rl.Color(255, 255, 255, 255 if on else 120))
+
+  def _sonata_route_exec_label(self):
+    # SPRINT32D_ROUTE_EXEC_HUD: ROUTE <STATE> <km/h> [STOP] green while actuating, grey ROUTE SHADOW otherwise,
+    # red ROUTE TAKEOVER <reason> when the executor asks the driver to take over.
+    rx = self._sonata_rx
+    if not isinstance(rx, dict) or not rx:
+      return None, None
+    state = str(rx.get("state") or "").upper()[:14]
+    if not state:
+      return None, None
+    if rx.get("takeover"):
+      why = str(rx.get("why") or "").replace("_", " ").upper()[:22]
+      return ("ROUTE TAKEOVER " + why).strip(), rl.Color(255, 80, 80, 255)
+    vt = rx.get("vTarget")
+    v = " %d" % int(round(float(vt) * 3.6)) if isinstance(vt, (int, float)) else ""
+    if rx.get("actuates"):
+      return "ROUTE " + state + v + (" STOP" if rx.get("shouldStop") else ""), rl.Color(120, 255, 160, 255)
+    if rx.get("armed") and rx.get("configured") and str(rx.get("mode") or "shadow") != "shadow":   # SPRINT32K_ARMED_LABEL
+      return "ROUTE ARMED " + state, rl.Color(255, 200, 60, 255)
+    return "ROUTE SHADOW " + state, rl.Color(170, 170, 170, 255)
+
+  def _sonata_weather_label(self):
+    # SPRINT20E_HUD: weather from the guidance daemon (open-meteo, Sprint 20f).
+    w = (self._sonata_route or {}).get("weather") if isinstance(self._sonata_route, dict) else None
+    if not isinstance(w, dict) or w.get("code") is None:
+      return None, None
+    code = int(w.get("code") or 0)
+    temp = w.get("tempC")
+    if code >= 95:
+      text, colour = "STORM", rl.Color(255, 120, 60, 255)
+    elif code >= 71 and code <= 77 or code in (85, 86):
+      text, colour = "SNOW", rl.Color(200, 230, 255, 255)
+    elif code >= 51:
+      text, colour = "RAIN", rl.Color(120, 180, 255, 255)
+    elif code >= 45:
+      text, colour = "FOG", rl.Color(200, 200, 200, 255)
+    elif isinstance(temp, (int, float)) and temp <= 2.0:
+      text, colour = "ICE RISK", rl.Color(180, 220, 255, 255)
+    else:
+      return None, None
+    if isinstance(temp, (int, float)):
+      text += f" {temp:.0f}C"
+    return text, colour
+
+  def _draw_sonata_car_glyph(self, x, y, fill, outline, solid=True):
+    w, h = 30, 54
+    rx, ry = int(x - w / 2), int(y - h / 2)
+    if solid:
+      rl.draw_rectangle(rx, ry, w, h, fill)
+    rl.draw_rectangle_lines_ex(rl.Rectangle(rx, ry, w, h), 3, outline)
+    rl.draw_rectangle(rx + 5, ry + 8, w - 10, 10, rl.Color(outline.r, outline.g, outline.b, 180))
+
+  def _draw_sonata_source_scene(self, sm, radar_state):
+    # Visualization only. Never feeds planning or controls.
+    car_state = sm['carState']
+    rect = self._rect
+    cx = rect.x + rect.width / 2
+    ego_y = rect.y + rect.height - 100
+
+    # Ego reference car.
+    self._draw_sonata_car_glyph(cx, ego_y, rl.Color(38, 45, 56, 220), rl.Color(235, 240, 245, 235), True)
+
+    # OEM blind-spot indicators are occupancy warnings, not object coordinates.
+    bsm_fill = rl.Color(255, 154, 31, 210)
+    bsm_outline = rl.Color(255, 220, 120, 255)
+    if car_state.leftBlindspot:
+      self._draw_sonata_car_glyph(cx - 78, ego_y - 8, bsm_fill, bsm_outline, True)
+    if car_state.rightBlindspot:
+      self._draw_sonata_car_glyph(cx + 78, ego_y - 8, bsm_fill, bsm_outline, True)
+
+    # When reversing, only show a generic rear hazard marker if the OEM itself
+    # reports stock AEB/FCW. We do not manufacture a rear object position.
+    gear_text = str(car_state.gearShifter).split('.')[-1].lower()
+    if gear_text == 'reverse' and (car_state.stockAeb or car_state.stockFcw):
+      self._draw_sonata_car_glyph(cx, ego_y + 66, rl.Color(210, 35, 45, 230), rl.Color(255, 175, 175, 255), True)
+
+    if radar_state is None or self._path.raw_points.size == 0:
+      return
+    path_x = self._path.raw_points[:, 0]
+    self._draw_sonata_radar_tracks(path_x)  # SPRINT19B_RADAR_HUD
+    for lead in (radar_state.leadOne, radar_state.leadTwo):
+      if not lead.present or lead.dRel <= 0:
+        continue
+      idx = self._get_path_length_idx(path_x, lead.dRel)
+      z = self._path.raw_points[idx, 2] if idx < len(self._path.raw_points) else 0.0
+      point = self._map_to_screen(lead.dRel, -lead.yRel + self._camera_offset, z + self._path_offset_z)
+      if not point:
+        continue
+      if lead.radar:
+        # radar=True means the selected lead is matched to a radar track.
+        fill, outline, solid = rl.Color(15, 205, 225, 220), rl.Color(165, 250, 255, 255), True
+      else:
+        # Vision/model-only lead: outline, deliberately not presented as radar.
+        fill, outline, solid = rl.Color(0, 0, 0, 0), rl.Color(255, 210, 70, 255), False
+      self._draw_sonata_car_glyph(point[0], point[1], fill, outline, solid)
 
   def _draw_lead_indicator(self):
     # Draw lead vehicles if available

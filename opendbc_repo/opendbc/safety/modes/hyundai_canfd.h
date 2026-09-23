@@ -142,7 +142,15 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
 
 static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
   const TorqueSteeringLimits HYUNDAI_CANFD_STEERING_LIMITS = {
-    .max_torque = 270,
+    // SPRINT18A_DYNAMIC_STEER_MAX: 2025 Sonata ccNC. SPRINT31AQ_STEER384_ALL: full 384 at every speed -
+    // the OEM camera drives the same 0x12a torque channel and comma's CAN-FD 270 was a choice, not an EPS
+    // limit. Rate/rt/driver-allowance limits below are unchanged and are what preserve driver override.
+    .max_torque = 384,
+    .dynamic_max_torque = true,
+    .max_torque_lookup = {
+      {8., 14., 21.},
+      {384., 384., 384.},
+    },
     .max_rt_delta = 112,
     .max_rate_up = 2,
     .max_rate_down = 3,

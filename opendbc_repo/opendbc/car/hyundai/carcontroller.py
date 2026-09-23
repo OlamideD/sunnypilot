@@ -6,12 +6,61 @@ from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, Buttons, CarControllerParams, CAR
+
+# SPRINT18A_DYNAMIC_STEER_MAX: one m/s more conservative than the Panda table, which the safety code
+# evaluates at (min vehicle speed - 1 m/s).
+# SPRINT31AQ_STEER384_ALL: the table is now flat - 384 at every speed, matching the Panda table
+# {8,14,21}->{384,384,384}. The function and breakpoints are kept so the Panda/controller consistency
+# test and any future taper need no structural change.
+SONATA_STEER_MAX_BP = [9.0, 14.0, 21.0]
+SONATA_STEER_MAX_V = [384.0, 384.0, 384.0]
+
+
+def sonata_dynamic_steer_max(v_ego: float, steer_max: int) -> int:
+  if steer_max <= 270:
+    return steer_max
+  return int(np.interp(float(v_ego), SONATA_STEER_MAX_BP, SONATA_STEER_MAX_V))
+
+
 from opendbc.car.interfaces import CarControllerBase
 
 from opendbc.sunnypilot.car.hyundai.escc import EsccCarController
 from opendbc.sunnypilot.car.hyundai.icbm import IntelligentCruiseButtonManagementInterface
 from opendbc.sunnypilot.car.hyundai.longitudinal.controller import LongitudinalController
 from opendbc.sunnypilot.car.hyundai.lead_data_ext import LeadDataCarController
+from opendbc.sunnypilot.car.hyundai.lead_data_ext import CanFdLeadData as _SonataCanFdLeadData  # SPRINT34D_VIRTUAL_TARGET
+import os as _sonata_vt_os  # SPRINT34D_VIRTUAL_TARGET
+import time as _sonata_vt_time  # SPRINT34D_VIRTUAL_TARGET
+SONATA_VT_ON_FILE = '/data/sonata_virtual_target_on'  # SPRINT34D_VIRTUAL_TARGET: opt-in, off by default
+SONATA_VT_DIST_M = 3.0      # stock reported 2.8-3.8 m for a real stopped lead at the stops that held
+SONATA_VT_MAX_V = 0.3       # m/s: a controlled standstill, including idle-creep speeds
+_sonata_vt_flag = {'t': -1e9, 'v': False}
+
+
+def _sonata_vt_enabled():
+  now = _sonata_vt_time.monotonic()
+  if now - _sonata_vt_flag['t'] > 1.0:
+    _sonata_vt_flag['t'] = now
+    _sonata_vt_flag['v'] = _sonata_vt_os.path.exists(SONATA_VT_ON_FILE)
+  return _sonata_vt_flag['v']
+
+
+def sonata_virtual_target(enabled, long_active, gas_override, stopping, v_ego, lead_data, cruise_info, flag_on=None):
+  """SPRINT34D_VIRTUAL_TARGET: (lead_data, cruise_info) to send. Stock values unless openpilot is holding a
+  lead-less standstill, when a stationary object SONATA_VT_DIST_M ahead is reported to the ESC."""
+  try:
+    on = _sonata_vt_enabled() if flag_on is None else flag_on
+    if not (on and enabled and long_active and not gas_override and stopping and v_ego < SONATA_VT_MAX_V
+            and not lead_data.lead_visible):
+      return lead_data, cruise_info
+    vt = _SonataCanFdLeadData(2, SONATA_VT_DIST_M, 0.0, True)
+    if cruise_info is not None:
+      cruise_info = dict(cruise_info)
+      cruise_info['ACC_ObjDist'] = SONATA_VT_DIST_M
+      cruise_info['ACC_ObjRelSpd'] = 0.0
+    return vt, cruise_info
+  except Exception:
+    return lead_data, cruise_info   # never let this path break the control message
 from opendbc.sunnypilot.car.hyundai.mads import MadsCarController
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
@@ -86,7 +135,9 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
 
     # steering torque
     new_torque = int(round(actuators.torque * self.params.STEER_MAX))
-    apply_torque = apply_driver_steer_torque_limits(new_torque, self.apply_torque_last, CS.out.steeringTorque, self.params)
+    sonata_steer_max = sonata_dynamic_steer_max(CS.out.vEgo, self.params.STEER_MAX)
+    apply_torque = apply_driver_steer_torque_limits(new_torque, self.apply_torque_last, CS.out.steeringTorque, self.params,
+                                                    steer_max=sonata_steer_max)
 
     # >90 degree steering fault prevention
     self.angle_limit_counter, apply_steer_req = common_fault_avoidance(abs(CS.out.steeringAngleDeg) >= MAX_ANGLE, CC.latActive,
@@ -229,9 +280,11 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
       elif not ccnc_non_hda2:
         can_sends.extend(hyundaicanfd.create_fca_warning_light(self.packer, self.CAN, self.frame))
       if self.frame % 2 == 0:
+        _vt_lead, _vt_cruise = sonata_virtual_target(CC.enabled, CC.longActive, CC.cruiseControl.override, stopping,  # SPRINT34D_VIRTUAL_TARGET
+                                                     CS.out.vEgo, self.lead_data, CS.cruise_info if ccnc_non_hda2 else None)
         can_sends.append(hyundaicanfd.create_acc_control(self.packer, self.CAN, CC.enabled, self.accel_last, accel, stopping, CC.cruiseControl.override,
-                                                         set_speed_in_units, hud_control, self.lead_data, CS.main_cruise_enabled, self.tuning,
-                                                         CS.cruise_info if ccnc_non_hda2 else None))
+                                                         set_speed_in_units, hud_control, _vt_lead, CS.main_cruise_enabled, self.tuning,
+                                                         _vt_cruise))
         self.accel_last = accel
     else:
       # button presses

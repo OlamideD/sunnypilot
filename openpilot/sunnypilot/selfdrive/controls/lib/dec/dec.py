@@ -13,6 +13,60 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot.selfdrive.controls.lib.dec.constants import WMACConstants
 from typing import Literal
+import json
+import os
+import time
+
+# SPRINT20C_DEC_CONTROL: a traffic signal / stop sign (Sprint 18c) or a route turn close ahead on the ACTIVE route asks for
+# blended (end-to-end) mode, so the model's learned stopping takes over early. Disable: /data/sonata_dec_control_off.
+SONATA_GUIDANCE_STATE = "/data/sonata_drive10_lab/route_guidance_state.json"
+SONATA_DEC_CONTROL_OFF = "/data/sonata_dec_control_off"
+SONATA_DEC_CONTROL_DIST_M = 120.0
+SONATA_DEC_TURN_DIST_M = 150.0
+
+
+class SonataControlAhead:
+  def __init__(self, path=SONATA_GUIDANCE_STATE):
+    self.path = path
+    self._mtime = None
+    self._check = 0.0
+    self.state = {}
+    self.reason = None
+
+  def ahead(self) -> bool:
+    now = time.monotonic()
+    if now - self._check >= 0.25:
+      self._check = now
+      try:
+        st = os.stat(self.path)
+        if st.st_mtime != self._mtime:
+          self._mtime = st.st_mtime
+          with open(self.path) as f:
+            obj = json.load(f)
+          self.state = obj if isinstance(obj, dict) else {}
+        if time.time() - st.st_mtime > 4.0 or os.path.exists(SONATA_DEC_CONTROL_OFF):
+          self.state = {}
+      except Exception:
+        self.state = {}
+    s = self.state
+    self.reason = None
+    if s.get("status") != "ACTIVE":
+      a = s.get("aheadTrafficControl")   # SPRINT21A_AHEAD_STOP: stop sign on the road being driven, no route needed
+      if isinstance(a, dict) and a.get("kind") == "stop" and isinstance(a.get("distanceM"), (int, float)) and a["distanceM"] <= SONATA_DEC_CONTROL_DIST_M:
+        self.reason = "stop %.0f m (ahead)" % a["distanceM"]
+        return True
+      return False
+    c = s.get("nextTrafficControl")
+    if isinstance(c, dict) and isinstance(c.get("distanceM"), (int, float)) and c["distanceM"] <= SONATA_DEC_CONTROL_DIST_M \
+        and str(c.get("kind")) != "signal":   # SPRINT20Q: no forced blending at signals (green-light hesitation, drives #186-#188)
+      self.reason = "%s %.0f m" % (c.get("kind"), c["distanceM"])
+      return True
+    m = str(s.get("nextManeuver") or "").lower()
+    d = s.get("nextManeuverDistanceM")
+    if m and m not in ("continue", "depart", "arrive", "notification", "new_name") and isinstance(d, (int, float)) and d <= SONATA_DEC_TURN_DIST_M:
+      self.reason = "%s %.0f m" % (m, d)
+      return True
+    return False
 
 # d-e2e, from modeldata.h
 TRAJECTORY_SIZE = 33
@@ -141,6 +195,9 @@ class DynamicExperimentalController:
     self._urgency = 0.0
 
     self._mode_manager = ModeTransitionManager()
+    self._sonata_control = SonataControlAhead()  # SPRINT20C_DEC_CONTROL
+    self._sonata_control_ahead = False
+    self._sonata_slow_frame = -10**9   # SPRINT23D_STOP_COMMIT
 
     # Smooth filters for stable decision making with faster response for critical scenarios
     self._lead_filter = SmoothKalmanFilter(
@@ -302,6 +359,10 @@ class DynamicExperimentalController:
     self._has_slow_down = urgency_filtered > (WMACConstants.SLOW_DOWN_PROB * 0.8)
     self._urgency = urgency_filtered
 
+  def _sonata_stop_commit(self) -> bool:   # SPRINT23D_STOP_COMMIT
+    return (self._frame - self._sonata_slow_frame) <= 60 and self._v_ego_kph < 22.0 \
+      and self._mode_manager.current_mode == 'blended' and not (self._standstill_count > 3)
+
   def _radarless_mode(self) -> None:
     """Radarless mode decision logic with emergency handling."""
 
@@ -310,8 +371,19 @@ class DynamicExperimentalController:
       self._mode_manager.request_mode('blended', confidence=1.0, emergency=True)
       return
 
+    # SPRINT20C_DEC_CONTROL: traffic control / route turn close ahead -> blended.
+    if self._sonata_control_ahead:
+      self._mode_manager.request_mode('blended', confidence=0.9)
+      return
+
     # Standstill: use blended
     if self._standstill_count > 3:
+      self._mode_manager.request_mode('blended', confidence=0.9)
+      return
+
+    # SPRINT23D_STOP_COMMIT: a stop in progress (slow-down cue within 3 s, below 22 km/h, already blended) stays blended
+    # until standstill; #190 handed the 17:45 stop sign back to ACC one second before the line.
+    if self._sonata_stop_commit():
       self._mode_manager.request_mode('blended', confidence=0.9)
       return
 
@@ -342,9 +414,18 @@ class DynamicExperimentalController:
       self._mode_manager.request_mode('blended', confidence=1.0, emergency=True)
       return
 
+    # SPRINT20C_DEC_CONTROL: traffic control / route turn close ahead -> blended (even with a lead).
+    if self._sonata_control_ahead:
+      self._mode_manager.request_mode('blended', confidence=0.9)
+      return
+
     # If lead detected and not in standstill: always use ACC
     if self._has_lead_filtered and not (self._standstill_count > 3):
       self._mode_manager.request_mode('acc', confidence=1.0)
+      return
+
+    if self._sonata_stop_commit():   # SPRINT23D_STOP_COMMIT (no lead)
+      self._mode_manager.request_mode('blended', confidence=0.9)
       return
 
     # Slow down scenarios: emergency for high urgency, normal for lower urgency
@@ -377,6 +458,9 @@ class DynamicExperimentalController:
     self.set_mpc_fcw_crash_cnt()
 
     self._update_calculations(sm)
+    self._sonata_control_ahead = self._sonata_control.ahead()  # SPRINT20C_DEC_CONTROL
+    if self._has_slow_down:   # SPRINT23D_STOP_COMMIT
+      self._sonata_slow_frame = self._frame
 
     if self._CP.radarUnavailable:
       self._radarless_mode()

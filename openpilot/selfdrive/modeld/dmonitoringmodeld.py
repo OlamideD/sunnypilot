@@ -108,7 +108,11 @@ def get_driverstate_packet(model_output, frame_id: int, location_ts: int, exec_t
 
 
 def main():
-  config_realtime_process(7, 5)
+  # SPRINT30B_MODEL_CORE: was core 7, shared with the DRIVING model (modeld_v2/modeld.py:329 asks for 7 too),
+  # while isolcpus=6,7 reserves TWO realtime cores and core 6 sat completely idle. Measured onroad on
+  # drive #200: modeld_tinygrad 330.6 MB / 21.7% CPU and dmonitoringmodeld 197.9 MB / 16.0% CPU, both
+  # on core 7. Give the driving model core 7 to itself and put driver monitoring on the reserved core.
+  config_realtime_process(6, 5)
 
   cloudlog.warning("connecting to cabin stream")
   vipc_client = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_CABIN, True)

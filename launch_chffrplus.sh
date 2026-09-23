@@ -85,6 +85,13 @@ function launch {
     agnos_init
   fi
 
+  # SONATA_PROJECT_BACKGROUND_SERVICES
+  # Sonata project services live on persistent /data.
+  # AGNOS /etc is read-only, so these are supervised outside systemd.
+  if [ -x /data/sonata-services-start ]; then
+    /data/sonata-services-start || true
+  fi
+
   # write tmux scrollback to a file
   tmux capture-pane -pq -S-1000 > /tmp/launch_log
 

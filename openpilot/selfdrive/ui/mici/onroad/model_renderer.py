@@ -14,6 +14,7 @@ from openpilot.system.ui.lib.shader_polygon import draw_polygon, Gradient
 from openpilot.system.ui.widgets import Widget
 
 from openpilot.selfdrive.ui.sunnypilot.mici.onroad.model_renderer import LANE_LINE_COLORS_SP, ModelRendererSP
+from openpilot.selfdrive.ui.mici.onroad.sonata_overlay import SonataOverlay  # SONATA_MICI_HUD
 
 CLIP_MARGIN = 500
 MIN_DRAW_DISTANCE = 10.0
@@ -56,6 +57,7 @@ class ModelRenderer(Widget, ModelRendererSP):
   def __init__(self):
     Widget.__init__(self)
     ModelRendererSP.__init__(self)
+    self._sonata = SonataOverlay()  # SONATA_MICI_HUD
     self._longitudinal_control = False
     self._experimental_mode = False
     self._blend_filter = FirstOrderFilter(1.0, 0.25, 1 / gui_app.target_fps)
@@ -153,6 +155,7 @@ class ModelRenderer(Widget, ModelRendererSP):
     if ui_state.status != UIStatus.DISENGAGED:
       self._draw_lane_lines()
       self._draw_path(sm)
+    self._sonata.render(self, sm, radar_state, rect)  # SONATA_MICI_HUD: badges, radar boxes, leads, blind spot, pedals
 
     # if render_lead_indicator and radar_state:
     #   self._draw_lead_indicator()

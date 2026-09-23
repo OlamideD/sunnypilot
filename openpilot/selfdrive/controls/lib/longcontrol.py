@@ -9,6 +9,67 @@ CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
+# SPRINT32BG_SMOOTH_STOP: final-stop smoothing (trial of sunnypilot PR #2034 with a causation term). See tools/sonata/sprint32/longcontrol.
+import os as _sonata_os
+SONATA_STOP_SMOOTH_OFF = '/data/sonata_stop_smooth_off'
+SONATA_STOPPING_TIME_S = 2.5
+SONATA_STOPPING_DISTANCE_M = 1.5
+SONATA_STOPPED_SPEED = 0.02
+SONATA_MIN_HOLD_ACCEL = -0.2
+SONATA_CAUSE_TOL = 0.4          # hold only a command at least as strong as the measured deceleration (minus this)
+SONATA_ROLLING_RATE = 0.3       # m/s^2/s ramp while still rolling (stock: 1.0)
+SONATA_STOPPED_RATE = 2.0       # m/s^2/s once at rest: build the holding brake as before
+# SPRINT34A_ARRIVE_HELD: idle creep settles the car at 0.03-0.12 m/s, so it never reaches SONATA_STOPPED_SPEED
+# and the firm rate above never triggered. Below this speed a car that is not clearly decelerating is AT the
+# creep equilibrium, and the hold is built fast. After 32BG, 2 of 52 lead stops crept with a -0.04 command.
+SONATA_HOLD_ZONE_V = 0.30       # m/s
+SONATA_HOLD_ZONE_DECEL = -0.10  # m/s^2: decelerating less than this in the hold zone = not stopping on its own
+SONATA_CREEP_RATE = 4.0         # m/s^2/s: inside the 5.0 JerkLowerLimit sent to the car; not felt, the car is ~stopped
+
+
+def sonata_in_creep_zone(v_ego, a_ego):
+  return v_ego <= SONATA_HOLD_ZONE_V and (a_ego is None or a_ego > SONATA_HOLD_ZONE_DECEL)
+_sonata_off = {'t': -1e9, 'v': False}
+
+
+def _sonata_smooth_off():
+  import time as _t
+  now = _t.monotonic()
+  if now - _sonata_off['t'] > 1.0:
+    _sonata_off['t'] = now
+    _sonata_off['v'] = _sonata_os.path.exists(SONATA_STOP_SMOOTH_OFF)
+  return _sonata_off['v']
+
+
+def sonata_hold_stopping(last_output_accel, v_ego, a_ego, a_target):
+  """True while the current brake command is already stopping the car well enough to stop within 1.5 m / 2.5 s
+  and is at least as strong as that deceleration (so it is its cause): hold it instead of ramping toward stopAccel."""
+  if _sonata_smooth_off():
+    return False
+  cmd = float(last_output_accel)
+  if sonata_in_creep_zone(v_ego, a_ego):
+    return False   # SPRINT34A_ARRIVE_HELD: never freeze a command that is not stopping the car
+  return (cmd <= SONATA_MIN_HOLD_ACCEL and a_target >= cmd and v_ego > SONATA_STOPPED_SPEED and a_ego < 0.0
+          and v_ego <= -a_ego * SONATA_STOPPING_TIME_S and v_ego * v_ego <= -2.0 * a_ego * SONATA_STOPPING_DISTANCE_M
+          and cmd <= a_ego + SONATA_CAUSE_TOL)   # a command WEAKER than the deceleration is not its cause: never hold it
+
+
+SONATA_NOT_BITING_ACCEL = -0.3     # rolling with less deceleration than this under a real brake command: the brake is not biting
+SONATA_REAL_BRAKE_CMD = -0.5
+
+
+def sonata_stopping_rate(v_ego, a_ego=None, cmd=None):
+  if _sonata_smooth_off():
+    return 1.0
+  if v_ego <= SONATA_STOPPED_SPEED:
+    return SONATA_STOPPED_RATE
+  if sonata_in_creep_zone(v_ego, a_ego):
+    return SONATA_CREEP_RATE   # SPRINT34A_ARRIVE_HELD
+  # never a rolling stop: a real brake command that is not producing deceleration ramps at the stock rate
+  if a_ego is not None and cmd is not None and cmd <= SONATA_REAL_BRAKE_CMD and a_ego > SONATA_NOT_BITING_ACCEL:
+    return 1.0
+  return SONATA_ROLLING_RATE
+
 
 def long_control_state_trans(CP_SP, active, long_control_state,
                              should_stop, brake_pressed, cruise_standstill):
@@ -65,10 +126,10 @@ class LongControl:
 
     elif self.long_control_state == LongCtrlState.stopping:
       output_accel = self.last_output_accel
-      if output_accel > self.CP.stopAccel:
+      if output_accel > self.CP.stopAccel and not sonata_hold_stopping(output_accel, CS.vEgo, CS.aEgo, a_target):   # SPRINT32BG_SMOOTH_STOP
         output_accel = min(output_accel, 0.0)
         # TODO: can we just go straight to stopAccel?
-        output_accel -= 1.0 * DT_CTRL  # m/s^2/s while trying to stop
+        output_accel -= sonata_stopping_rate(CS.vEgo, CS.aEgo, output_accel) * DT_CTRL   # SPRINT32BG_SMOOTH_STOP (stock: 1.0 m/s^2/s)
       self.reset()
 
     else:  # LongCtrlState.pid

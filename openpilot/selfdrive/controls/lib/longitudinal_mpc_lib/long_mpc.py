@@ -57,24 +57,45 @@ COMFORT_BRAKE = 2.5
 STOP_DISTANCE = 6.0
 MIN_X_LEAD_FACTOR = 0.5
 
+# SPRINT20B_PERSONALITY: the planner (same process) fills SONATA_PERSONALITY from /data/sonata_personality.json every
+# second: {"tFollow": {"relaxed":1.75,"standard":1.45,"aggressive":1.25}, "jerk": {...}, "trafficMode": {"tFollow": 1.0,
+# "jerk": 0.6}, "trafficActive": bool}. Missing keys fall back to the stock values below. Values are clamped.
+SONATA_PERSONALITY = {"tFollow": {}, "jerk": {}, "trafficMode": {}, "trafficActive": False, "tFollowAdd": 0.0}
+SONATA_T_FOLLOW_MIN, SONATA_T_FOLLOW_MAX = 0.9, 3.0
+SONATA_JERK_MIN, SONATA_JERK_MAX = 0.3, 2.0
+
+
+def sonata_personality_value(kind, name, default, lo, hi):
+  try:
+    if SONATA_PERSONALITY.get("trafficActive") and kind in SONATA_PERSONALITY.get("trafficMode", {}):
+      v = float(SONATA_PERSONALITY["trafficMode"][kind])
+    else:
+      v = float(SONATA_PERSONALITY.get(kind, {}).get(name, default))
+    if kind == "tFollow":
+      v += float(SONATA_PERSONALITY.get("tFollowAdd", 0.0))   # SPRINT20I_LOW_GRIP: longer following on low grip
+    return min(max(v, lo), hi)
+  except Exception:
+    return default
+
+
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
-    return 1.0
+    return sonata_personality_value("jerk", "relaxed", 1.0, SONATA_JERK_MIN, SONATA_JERK_MAX)
   elif personality==log.LongitudinalPersonality.standard:
-    return 1.0
+    return sonata_personality_value("jerk", "standard", 1.0, SONATA_JERK_MIN, SONATA_JERK_MAX)
   elif personality==log.LongitudinalPersonality.aggressive:
-    return 0.5
+    return sonata_personality_value("jerk", "aggressive", 0.5, SONATA_JERK_MIN, SONATA_JERK_MAX)
   else:
     raise NotImplementedError("Longitudinal personality not supported")
 
 
 def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
-    return 1.75
+    return sonata_personality_value("tFollow", "relaxed", 1.75, SONATA_T_FOLLOW_MIN, SONATA_T_FOLLOW_MAX)
   elif personality==log.LongitudinalPersonality.standard:
-    return 1.45
+    return sonata_personality_value("tFollow", "standard", 1.45, SONATA_T_FOLLOW_MIN, SONATA_T_FOLLOW_MAX)
   elif personality==log.LongitudinalPersonality.aggressive:
-    return 1.25
+    return sonata_personality_value("tFollow", "aggressive", 1.25, SONATA_T_FOLLOW_MIN, SONATA_T_FOLLOW_MAX)
   else:
     raise NotImplementedError("Longitudinal personality not supported")
 

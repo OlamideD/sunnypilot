@@ -34,6 +34,7 @@ from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.system import sentry
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
+from openpilot.sunnypilot.selfdrive.controls.lib.sonata_lane_request import sonata_carstate_for_desire, sonata_route_desire  # SPRINT19F_LANE_REQUEST / SPRINT21C_P6_KEEP_DESIRE
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value
 from openpilot.selfdrive.modeld.modeld import ChestnutState
 
@@ -451,7 +452,7 @@ def main(demo=False):
       meta_extra = meta_main
 
     sm.update(0)
-    desire = DH.desire
+    desire = sonata_route_desire(DH.desire, sm['carState'])  # SPRINT21C_P6_KEEP_DESIRE: opt-in keepLeft/keepRight for exits
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["narrowRoadCameraState"].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
@@ -531,7 +532,7 @@ def main(demo=False):
       r_lane_change_prob = desire_state[log.Desire.laneChangeRight]
       lane_change_prob = l_lane_change_prob + r_lane_change_prob
       left_edge, right_edge = RELC.update_and_fill(modelv2_send.modelV2, mdv2sp_send.modelDataV2SP, v_ego)
-      DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob, left_edge, right_edge)
+      DH.update(sonata_carstate_for_desire(sm['carState']), sm['carControl'].latActive, lane_change_prob, left_edge, right_edge)  # SPRINT19F_LANE_REQUEST
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
       modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
       mdv2sp_send.modelDataV2SP.laneTurnDirection = DH.lane_turn_direction

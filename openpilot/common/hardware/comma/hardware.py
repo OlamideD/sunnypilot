@@ -57,6 +57,27 @@ def get_default_route_iface():
     routes = [(int(route[6]), route[0]) for line in f.readlines()[1:] if (route := line.split())[1] == "00000000" and int(route[3], 16) & 0x1]
   return min(routes)[1] if routes else None
 
+# SPRINT31P_NET_CACHE: get_network_metered costs 388.71 ms on Wi-Fi (measured on the car, max 678.92 ms)
+# because it spawns a `sudo` subprocess for every *.nmconnection file, and hardwared asks for it every
+# 500 ms. That starved deviceState to 1.778 Hz, under SubMaster's 1.6 Hz floor, which raises
+# commIssueAvgFreq - a SOFT_DISABLE. get_network_strength costs another 45.50 ms. Neither value needs
+# 2 Hz fidelity. Keyed on network_type so changing network invalidates immediately; the TTL means an
+# edit to a keyfile on disk is still picked up shortly after.
+SONATA_NET_CACHE_TTL = 60.0        # seconds - metered state changes when the network does
+SONATA_STRENGTH_CACHE_TTL = 5.0    # seconds - a status icon does not need better than 0.2 Hz
+_SONATA_NET_CACHE: dict = {}
+
+
+def _sonata_net_cached(name, key, ttl, compute):
+  """Return compute() at most once per ttl for a given key. Never caches an exception."""
+  now = time.monotonic()
+  hit = _SONATA_NET_CACHE.get(name)
+  if hit is not None and hit[0] == key and (now - hit[1]) < ttl:
+    return hit[2]
+  value = compute()
+  _SONATA_NET_CACHE[name] = (key, now, value)
+  return value
+
 class HardwareComma(HardwareBase):
   """
     This platform covers the Snapdragon 845-based comma devices:
@@ -185,6 +206,11 @@ class HardwareComma(HardwareBase):
       return NetworkStrength.great
 
   def get_network_strength(self, network_type):
+    # SPRINT31P_NET_CACHE: 45.50 ms per call; a status icon does not need 2 Hz.
+    return _sonata_net_cached("strength", network_type, SONATA_STRENGTH_CACHE_TTL,
+                              lambda: self._sonata_get_network_strength_uncached(network_type))
+
+  def _sonata_get_network_strength_uncached(self, network_type):
     network_strength = NetworkStrength.unknown
 
     try:
@@ -209,6 +235,13 @@ class HardwareComma(HardwareBase):
     if network_type in (NetworkType.cell2G, NetworkType.cell3G, NetworkType.cell4G, NetworkType.cell5G):
       from openpilot.common.params import Params
       return Params().get_bool("GsmMetered")
+    # SPRINT31P_NET_CACHE: the Wi-Fi path below spawns a sudo subprocess per NetworkManager keyfile and
+    # measured 388.71 ms on this device. hardwared calls it every 500 ms, which starved deviceState
+    # below the 1.6 Hz floor and soft-disengaged openpilot. Cache it.
+    return _sonata_net_cached("metered", network_type, SONATA_NET_CACHE_TTL,
+                              lambda: self._sonata_get_network_metered_uncached(network_type))
+
+  def _sonata_get_network_metered_uncached(self, network_type) -> bool:
     try:
       if network_type == NetworkType.wifi:
         ssid = wpa_supplicant_cmd("STATUS").get("ssid", "")
