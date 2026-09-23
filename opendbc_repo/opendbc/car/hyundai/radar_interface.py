@@ -62,6 +62,9 @@ class RadarInterface(RadarInterfaceBase, RadarInterfaceExt):
     self.sonata_rcp = get_sonata_radar_parser() if sonata_radar_active(CP) else None
     self.sonata_pts = {}
     self.sonata_track_id = 100000   # well clear of the ext / stock ids
+    # SPRINT35B_YREL_SIGN: radard scores yRel against -lead.y, so yRel must be LEFT-positive = +LAT_DIST.
+    # /data/sonata_radar_yrel_legacy restores the 31au sign (-LAT_DIST); read once, at interface build.
+    self.sonata_yrel_sign = -1.0 if os.path.exists("/data/sonata_radar_yrel_legacy") else 1.0
 
   def update(self, can_strings):
     if self.radar_off_can or (self.rcp is None):
@@ -124,8 +127,8 @@ class RadarInterface(RadarInterfaceBase, RadarInterfaceExt):
   def sonata_update(self, ret):
     """SPRINT31AU_SONATA_RADAR_ACTIVE: append every measured (3) / coasted (4) track of the 0x3A5-0x3C4 family.
 
-    dRel = LONG_DIST (radard subtracts RADAR_TO_CAMERA itself), yRel = -LAT_DIST (LAT is left-positive on this
-    radar; radard's yRel is right-positive, see Track.update '# -LAT_DIST'), vRel = REL_SPEED. Track ids are
+    dRel = LONG_DIST (radard subtracts RADAR_TO_CAMERA itself), yRel = +LAT_DIST (SPRINT35B_YREL_SIGN: LAT is
+    left-positive and so is radard's yRel - match_vision_to_track compares it with -lead.y), vRel = REL_SPEED. Track ids are
     stable per address while the track stays alive, as the stock Hyundai interface does. If our parser is not
     valid this cycle we contribute nothing - the SCC point path above is untouched."""
     if not self.sonata_rcp.can_valid:
@@ -140,7 +143,7 @@ class RadarInterface(RadarInterfaceBase, RadarInterfaceExt):
           self.sonata_pts[addr] = pt
         pt = self.sonata_pts[addr]
         pt.dRel = float(msg["LONG_DIST"])
-        pt.yRel = -float(msg["LAT_DIST"])
+        pt.yRel = self.sonata_yrel_sign * float(msg["LAT_DIST"])   # SPRINT35B_YREL_SIGN (was -LAT_DIST)
         pt.vRel = float(msg["REL_SPEED"])
       else:
         self.sonata_pts.pop(addr, None)

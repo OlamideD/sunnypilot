@@ -228,6 +228,10 @@ P6_TURN_MAX_V = 22.0          # m/s (79 km/h)
 P6_DESIRE = {"left": 5, "right": 6}   # log.Desire.keepLeft / keepRight
 P6_MANEUVERS = ("off_ramp", "fork", "merge", "on_ramp", "keep")
 P6_TURN_MANEUVERS = ("turn",)         # SPRINT26B_TURN_DESIRE
+# SPRINT35C_KEEP_REPULSE: keep the keep desire inside the model's 5 s pulse history all the way to the fork.
+P6_REPULSE_FLAG = "/data/sonata_p6_keep_repulse_on"   # owner switch, OFF unless the file exists
+P6_REPULSE_S = 2.5            # one `none` frame this often -> a fresh rising edge (history is 5 s)
+P6_KEEP_HOLD_MIN_V = 11.0     # m/s: once sent for this maneuver, keep sending down to this (arming stays 16 m/s)
 
 
 class SonataRouteDesire:
@@ -242,6 +246,8 @@ class SonataRouteDesire:
     self.side = None
     self.dist = None
     self.kind = None          # "keep" (21c) or "turn" (26b)
+    self.repulse_on = False   # SPRINT35C_KEEP_REPULSE
+    self._keep_code, self._keep_edge, self._pulses = None, 0.0, 0   # SPRINT35C_KEEP_REPULSE
 
   def poll(self, now: float | None = None):
     now = time.monotonic() if now is None else now
@@ -249,6 +255,7 @@ class SonataRouteDesire:
       self._next_flag = now + 2.0
       self.enabled = os.path.exists(self.flag)
       self.turn_enabled = os.path.exists(self.turn_flag)
+      self.repulse_on = os.path.exists(P6_REPULSE_FLAG)   # SPRINT35C_KEEP_REPULSE
     if now < self._next_poll:
       return
     self._next_poll = now + 0.25
@@ -299,7 +306,8 @@ class SonataRouteDesire:
       row = {"utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "kind": self.kind, "side": self.side,
              "distM": self.dist, "vEgo": round(float(v_ego), 2), "dhDesire": int(dh_desire),
              "wouldSend": (would[0] if would else 0), "wouldKind": (would[1] if would else None),
-             "sent": int(sent), "keepEnabled": self.enabled, "turnEnabled": self.turn_enabled}
+             "sent": int(sent), "keepEnabled": self.enabled, "turnEnabled": self.turn_enabled,
+             "repulse": bool(self.repulse_on), "pulses": int(self._pulses)}   # SPRINT35C_KEEP_REPULSE
       tmp = P6_SHADOW_FILE + ".tmp"
       with open(tmp, "w") as f:
         json.dump(row, f)
@@ -318,6 +326,26 @@ class SonataRouteDesire:
     except Exception:
       pass
 
+  def _sonata_repulse(self, now: float, sent: int, dh_desire: int, v_ego: float) -> int:
+    """SPRINT35C_KEEP_REPULSE: re-pulse / hold an active keep. Identity when the switch is off."""
+    if not (self.repulse_on and self.enabled):
+      self._keep_code, self._keep_edge, self._pulses = None, 0.0, 0
+      return sent
+    code = P6_DESIRE.get(self.side) if (self.kind == "keep" and self.side) else None
+    if (sent not in (5, 6) and code is not None and int(dh_desire) == 0 and self._keep_code == code
+        and float(v_ego) >= P6_KEEP_HOLD_MIN_V):
+      sent = code                                   # hold below the 16 m/s arming speed for the same maneuver
+    if sent in (5, 6):
+      if self._keep_code != sent:
+        self._keep_code, self._keep_edge, self._pulses = sent, now, 0   # this frame is the first edge
+      elif now - self._keep_edge >= P6_REPULSE_S:
+        self._keep_edge = now
+        self._pulses += 1
+        return 0                                    # one none frame; the next frame is a fresh rising edge
+      return sent
+    self._keep_code = None
+    return sent
+
   def desire(self, dh_desire: int, v_ego: float, now: float | None = None) -> int:
     """The desire to feed the model: the helper's own when it is busy, else keepLeft/keepRight when the route asks."""
     now = time.monotonic() if now is None else now
@@ -329,6 +357,7 @@ class SonataRouteDesire:
         sent = would[0]
       elif would[1] == "turn" and self.turn_enabled:
         sent = would[0]
+    sent = self._sonata_repulse(now, sent, dh_desire, v_ego)   # SPRINT35C_KEEP_REPULSE
     self._shadow(now, dh_desire, v_ego, would, sent)
     return sent
 
