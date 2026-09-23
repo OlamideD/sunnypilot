@@ -186,6 +186,49 @@ def sonata_learned_budget(kappa, v):
   return _SONATA_LEARNED.budget(kappa, v)
 
 
+# SPRINT35A_CURVE_AUTHORITY: plan bend speed for the lateral accel the car can HOLD at that speed.
+# Measured 20 % peg-onset of desired lateral accel (engaged, hands off, road bends, 988 segments):
+# 0.8 @ 20 km/h, 1.2 @ 30, 1.6 @ 40, 2.0 @ 50, never above 55. See tools/sonata/sprint35/curves/.
+# Lower-only: the target is min(previous, ceiling); >= 50 km/h the ceiling (1.85) is above the 1.82 budget.
+SONATA_AUTH_LAT_BP = [7.0, 8.3, 11.1, 13.9]     # m/s (25, 30, 40, 50 km/h)
+SONATA_AUTH_LAT_V = [1.10, 1.25, 1.55, 1.85]    # m/s^2 holdable without pegging
+SONATA_AUTH_CEIL_MIN_V = 7.0                    # m/s: tighter bends are steering-ANGLE limited; no crawl
+SONATA_AUTH_CEIL_OFF = '/data/sonata_curve_authority_off'
+_SONATA_AUTH_V_GRID = np.arange(1.0, 45.0, 0.1)
+_sonata_auth_ceil = {"check": -1e9, "off": False}
+
+
+def sonata_authority_ceiling_off():
+  now = time.monotonic()
+  if now - _sonata_auth_ceil["check"] >= 1.0:
+    _sonata_auth_ceil["check"] = now
+    try:
+      import os
+      _sonata_auth_ceil["off"] = os.path.exists(SONATA_AUTH_CEIL_OFF)
+    except Exception:
+      _sonata_auth_ceil["off"] = False
+  return _sonata_auth_ceil["off"]
+
+
+def sonata_authority_ceiling_speed(kappa):
+  """Highest speed (m/s) at which kappa * v^2 stays within SONATA_AUTH_LAT(v), floored at
+  SONATA_AUTH_CEIL_MIN_V. Returns +inf when the curvature is unusable, so min() leaves the target alone."""
+  try:
+    k = float(kappa)
+    if not np.isfinite(k) or k <= 0.0:
+      return float('inf')
+    a = np.interp(_SONATA_AUTH_V_GRID, SONATA_AUTH_LAT_BP, SONATA_AUTH_LAT_V)
+    ok = k * _SONATA_AUTH_V_GRID * _SONATA_AUTH_V_GRID <= a
+    v = float(_SONATA_AUTH_V_GRID[ok].max()) if ok.any() else 0.0
+    # At and above the last breakpoint the ceiling (1.85) is >= every existing budget (1.82, learned <= 1.85),
+    # so the existing target already satisfies it: return +inf and leave fast bends bit-for-bit unchanged.
+    if v >= SONATA_AUTH_LAT_BP[-1] or bool(ok[-1]):
+      return float('inf')
+    return max(v, SONATA_AUTH_CEIL_MIN_V)
+  except Exception:
+    return float('inf')
+
+
 def sonata_curve_target_speed(kappa):
   """Curve speed for the lateral budget available AT that speed.
 
@@ -201,6 +244,8 @@ def sonata_curve_target_speed(kappa):
   learned = sonata_learned_budget(k, v)  # SPRINT20A_LEARNED_CURVE
   if learned is not None and learned > a_base * sonata_authority_scale(v):
     v = (learned / k) ** 0.5
+  if not sonata_authority_ceiling_off():   # SPRINT35A_CURVE_AUTHORITY: lower-only
+    v = min(v, sonata_authority_ceiling_speed(k))
   return float(v)
 
 

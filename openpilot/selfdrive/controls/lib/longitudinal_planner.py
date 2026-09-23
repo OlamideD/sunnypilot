@@ -164,6 +164,35 @@ def sonata_signal_prep_target(kind, dist_m, v_ego):
     return None
 
 
+# SPRINT35_STOP_CAP_CONTINUITY: keep the stop-sign envelope below 3 m/s until the stop is served.
+# See tools/sonata/sprint35/stops/hotfix_35_stop_cap_continuity.py.
+SONATA_STOP_CAP_CONT_OFF = '/data/sonata_stop_cap_continuity_off'
+SONATA_STOP_SERVED_V = 0.3          # m/s: the car has come to rest for this stop
+SONATA_STOP_SERVED_M = 30.0         # ... within this distance of the stop control
+SONATA_STOP_NEW_CTRL_JUMP_M = 15.0  # the control distance jumping up this much = a different control
+SONATA_STOP_GONE_S = 2.0            # no stop control for this long = forget the served flag
+
+
+def sonata_stop_cap_low_speed(kind, dist_m, v_ego):
+  """The stop envelope of sonata_signal_prep_target for v_ego < 3 m/s only, or None.
+
+  Identical formula, so the cap is continuous across 3 m/s; at or above 3 m/s this returns None and the original
+  function (unchanged) is the one that answers.
+  """
+  try:
+    if str(kind or '') != 'stop' or dist_m is None or v_ego is None:
+      return None
+    d = float(dist_m)
+    if not (0.0 <= d <= SONATA_SIGNAL_MAX_DIST_M) or float(v_ego) >= 3.0:
+      return None
+    v_min = SONATA_SIGNAL_V['stop']
+    d_eff = max(d - SONATA_SIGNAL_NODE_MARGIN_M, 0.0)
+    _sp_decel = SONATA_STOP_PREP_DECEL * (SONATA_GRIP_PREP_DECEL_SCALE if SONATA_LOW_GRIP_RP[0] else 1.0)
+    return max(float((v_min * v_min + 2.0 * _sp_decel * d_eff) ** 0.5), v_min)
+  except Exception:
+    return None
+
+
 # SPRINT19_LANE_CHANGE_LONG: while the runtime runs a lane change, the first car in the TARGET lane (passive radar,
 # /data/sonata_telemetry/radar_live.json) becomes a lower-only cruise cap so the car does not accelerate into it, and
 # the Sonata route/signal preparation caps are frozen so a lane change never gets a surprise deceleration of ours.
@@ -329,12 +358,17 @@ class SonataRoutePrep:
     self._arrival_committed = False   # SPRINT25A_ARRIVAL
     self._arrival_d_min = float('inf')
     self._low_grip = False
+    self._stop_served = False      # SPRINT35_STOP_CAP_CONTINUITY
+    self._stop_last_d = None
+    self._stop_seen_t = -1e9
+    self._stop_cont_off = False
 
   def _poll(self, now):
     if now - self._check < 0.25:
       return
     self._check = now
     self._signal_off = os.path.exists(SONATA_SIGNAL_PREP_OFF)  # SPRINT18C_SIGNAL_PREP
+    self._stop_cont_off = os.path.exists(SONATA_STOP_CAP_CONT_OFF)  # SPRINT35_STOP_CAP_CONTINUITY
     try:  # SPRINT25A: low-grip softens the approach decel
       with open(SONATA_GRIP_LIVE_FILE_RP) as _gf:
         _g = json.load(_gf)
@@ -427,14 +461,31 @@ class SonataRoutePrep:
         and isinstance(s.get('gpsAgeS'), (int, float)) and s.get('gpsAgeS') <= SONATA_ROUTE_GPS_MAX_AGE_S:
       control, route_ok = ahead, True
     signal_reason = reason if not route_ok else 'no_control_ahead'
+    # SPRINT35_STOP_CAP_CONTINUITY: a stop control is served once the car has come to rest within 30 m of it.
+    _sd = control.get('distanceM') if (control and route_ok and control.get('kind') == 'stop') else None
+    if isinstance(_sd, (int, float)):
+      if self._stop_last_d is not None and float(_sd) > self._stop_last_d + SONATA_STOP_NEW_CTRL_JUMP_M:
+        self._stop_served = False
+      if float(v_ego) <= SONATA_STOP_SERVED_V and float(_sd) <= SONATA_STOP_SERVED_M:
+        self._stop_served = True
+      self._stop_last_d = float(_sd)
+      self._stop_seen_t = now
+    elif now - self._stop_seen_t > SONATA_STOP_GONE_S:
+      self._stop_served, self._stop_last_d = False, None
     if control and route_ok:
       if self._signal_off:
         signal_reason = 'disabled'
       else:
         v_signal = sonata_signal_prep_target(control.get('kind'), control.get('distanceM'), v_ego)
         signal_reason = 'ok' if v_signal is not None else 'far'
+        # SPRINT35_STOP_CAP_CONTINUITY: below 3 m/s keep the stop envelope until this stop has been served.
+        if v_signal is None and not self._stop_cont_off and not self._stop_served:
+          v_signal = sonata_stop_cap_low_speed(control.get('kind'), control.get('distanceM'), v_ego)
+          if v_signal is not None:
+            signal_reason = 'ok_low_speed'
     self.signal_info = {'active': v_signal is not None, 'reason': signal_reason, 'kind': control.get('kind'),
-                        'distM': control.get('distanceM'), 'source': control.get('source'), 'vTarget': v_signal}
+                        'distM': control.get('distanceM'), 'source': control.get('source'), 'vTarget': v_signal,
+                        'served': bool(self._stop_served)}   # SPRINT35_STOP_CAP_CONTINUITY
     if v_signal is not None and (v_target is None or v_signal < v_target):
       return v_signal
     return v_target

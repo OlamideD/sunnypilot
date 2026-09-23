@@ -85,6 +85,11 @@ def sonata_crossable(side, given, now=None):
   """False only on a fresh, stable yellow line; otherwise whatever the caller passed (None = unknown = allowed)."""
   if given is not None:
     return given
+  # SPRINT35C_RIGHT_YELLOW_NEVER_BLOCKS: a yellow line is only ever on our LEFT in Ontario marking. A camera "yellow" on
+  # the right is street-light cast on white paint (14.9 % of known night rows) - or we are in the oncoming lane, where
+  # moving right is the move that must never be refused. Left side unchanged. Kill switch restores both sides.
+  if side == "right" and not _sonata_os.path.exists("/data/sonata_right_yellow_blocks_on"):
+    return None
   return False if sonata_lane_colour(side, now) == "yellow" else None
 
 
