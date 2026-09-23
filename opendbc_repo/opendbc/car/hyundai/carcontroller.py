@@ -22,6 +22,62 @@ def sonata_dynamic_steer_max(v_ego: float, steer_max: int) -> int:
   return int(np.interp(float(v_ego), SONATA_STEER_MAX_BP, SONATA_STEER_MAX_V))
 
 
+# SPRINT35A_OVERRIDE_RAMPIN: soften the torque hand-back after a driver override. See hotfix_35a_override_rampin.py.
+import os as _sonata_ri_os  # SPRINT35A_OVERRIDE_RAMPIN
+import time as _sonata_ri_time  # SPRINT35A_OVERRIDE_RAMPIN
+SONATA_RAMPIN_ON_FILE = '/data/sonata_override_rampin_on'  # opt-in, off by default
+SONATA_RAMPIN_GAP_MIN = 115        # CAN units: pent-up |request - applied| at release that arms the ramp (0.30 of 384)
+SONATA_RAMPIN_UP = 1               # CAN units per 10 ms frame while armed (stock STEER_DELTA_UP is 2)
+SONATA_RAMPIN_MAX_FRAMES = 100     # 1.0 s at 100 Hz
+_sonata_ri_flag = {'t': -1e9, 'v': False}
+
+
+def _sonata_rampin_enabled():
+  now = _sonata_ri_time.monotonic()
+  if now - _sonata_ri_flag['t'] > 1.0:
+    _sonata_ri_flag['t'] = now
+    _sonata_ri_flag['v'] = _sonata_ri_os.path.exists(SONATA_RAMPIN_ON_FILE)
+  return _sonata_ri_flag['v']
+
+
+class SonataOverrideRampIn:
+  """SPRINT35A_OVERRIDE_RAMPIN: after the driver lets go with a large pent-up request, let the applied torque grow
+  at half the stock rate for up to 1 s. Returns a value between apply_torque_last and the stock-limited
+  apply_torque, so it can only ever be gentler than stock."""
+
+  def __init__(self):
+    self.prev_pressed = False
+    self.frames_left = 0
+    self.armed_count = 0
+
+  def update(self, apply_torque, apply_torque_last, new_torque, steering_pressed, lat_active, flag_on=None):
+    try:
+      on = _sonata_rampin_enabled() if flag_on is None else flag_on
+      if not on or not lat_active or steering_pressed:
+        self.frames_left = 0
+        self.prev_pressed = bool(steering_pressed) and bool(lat_active)
+        return apply_torque
+      if self.prev_pressed:
+        self.prev_pressed = False
+        if abs(new_torque - apply_torque_last) >= SONATA_RAMPIN_GAP_MIN:
+          self.frames_left = SONATA_RAMPIN_MAX_FRAMES
+          self.armed_count += 1
+      if self.frames_left <= 0:
+        return apply_torque
+      self.frames_left -= 1
+      if abs(new_torque - apply_torque) <= SONATA_RAMPIN_UP:
+        self.frames_left = 0             # caught up with the request: back to stock
+        return apply_torque
+      if abs(apply_torque) > abs(apply_torque_last):
+        step = apply_torque - apply_torque_last
+        if abs(step) > SONATA_RAMPIN_UP:
+          return int(apply_torque_last + (SONATA_RAMPIN_UP if step > 0 else -SONATA_RAMPIN_UP))
+      return apply_torque
+    except Exception:
+      self.frames_left = 0
+      return apply_torque              # never let this path break the steering message
+
+
 from opendbc.car.interfaces import CarControllerBase
 
 from opendbc.sunnypilot.car.hyundai.escc import EsccCarController
@@ -119,6 +175,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
 
     self.accel_last = 0
     self.apply_torque_last = 0
+    self.sonata_rampin = SonataOverrideRampIn()  # SPRINT35A_OVERRIDE_RAMPIN
     self.car_fingerprint = CP.carFingerprint
     self.last_button_frame = 0
     self.cancel_counter = 0
@@ -138,6 +195,8 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
     sonata_steer_max = sonata_dynamic_steer_max(CS.out.vEgo, self.params.STEER_MAX)
     apply_torque = apply_driver_steer_torque_limits(new_torque, self.apply_torque_last, CS.out.steeringTorque, self.params,
                                                     steer_max=sonata_steer_max)
+    apply_torque = self.sonata_rampin.update(apply_torque, self.apply_torque_last, new_torque,  # SPRINT35A_OVERRIDE_RAMPIN
+                                             CS.out.steeringPressed, CC.latActive)
 
     # >90 degree steering fault prevention
     self.angle_limit_counter, apply_steer_req = common_fault_avoidance(abs(CS.out.steeringAngleDeg) >= MAX_ANGLE, CC.latActive,
