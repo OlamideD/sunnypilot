@@ -87,6 +87,41 @@ from opendbc.sunnypilot.car.hyundai.lead_data_ext import LeadDataCarController
 from opendbc.sunnypilot.car.hyundai.lead_data_ext import CanFdLeadData as _SonataCanFdLeadData  # SPRINT34D_VIRTUAL_TARGET
 import os as _sonata_vt_os  # SPRINT34D_VIRTUAL_TARGET
 import time as _sonata_vt_time  # SPRINT34D_VIRTUAL_TARGET
+SONATA_STOPREQ_V = 0.25   # SPRINT35F_STOPREQ_GATE: stock SCC raised StopReq at 0.03-0.21 m/s, never above
+SONATA_STOPREQ_GATE_OFF = '/data/sonata_stopreq_gate_off'
+_sonata_sr_flag = {'t': -1e9, 'v': False}
+
+
+def _sonata_sr_gate_off():
+  now = _sonata_vt_time.monotonic()
+  if now - _sonata_sr_flag['t'] > 1.0:
+    _sonata_sr_flag['t'] = now
+    _sonata_sr_flag['v'] = _sonata_vt_os.path.exists(SONATA_STOPREQ_GATE_OFF)
+  return _sonata_sr_flag['v']
+
+
+class _SonataTuningView:
+  """SPRINT35F_STOPREQ_GATE: the tuning object with only `stopping` overridden (it is what becomes StopReq)."""
+  def __init__(self, base, stopping):
+    self._sonata_base = base
+    self.stopping = stopping
+
+  def __getattr__(self, name):
+    return getattr(self._sonata_base, name)
+
+
+def sonata_stopreq_tuning(cc, tuning, v_ego):
+  """SPRINT35F_STOPREQ_GATE: StopReq only once the car is settling (< SONATA_STOPREQ_V); latched until the stop ends."""
+  try:
+    if _sonata_sr_gate_off() or not tuning.stopping:
+      cc._sonata_sr_on = False
+      return tuning
+    if getattr(cc, '_sonata_sr_on', False) or v_ego < SONATA_STOPREQ_V:
+      cc._sonata_sr_on = True
+      return tuning
+    return _SonataTuningView(tuning, False)
+  except Exception:
+    return tuning   # never let this path break the control message
 SONATA_VT_ON_FILE = '/data/sonata_virtual_target_on'  # SPRINT34D_VIRTUAL_TARGET: opt-in, off by default
 SONATA_VT_DIST_M = 3.0      # stock reported 2.8-3.8 m for a real stopped lead at the stops that held
 SONATA_VT_MAX_V = 0.3       # m/s: a controlled standstill, including idle-creep speeds
@@ -342,7 +377,7 @@ class CarController(CarControllerBase, EsccCarController, LeadDataCarController,
         _vt_lead, _vt_cruise = sonata_virtual_target(CC.enabled, CC.longActive, CC.cruiseControl.override, stopping,  # SPRINT34D_VIRTUAL_TARGET
                                                      CS.out.vEgo, self.lead_data, CS.cruise_info if ccnc_non_hda2 else None)
         can_sends.append(hyundaicanfd.create_acc_control(self.packer, self.CAN, CC.enabled, self.accel_last, accel, stopping, CC.cruiseControl.override,
-                                                         set_speed_in_units, hud_control, _vt_lead, CS.main_cruise_enabled, self.tuning,
+                                                         set_speed_in_units, hud_control, _vt_lead, CS.main_cruise_enabled, sonata_stopreq_tuning(self, self.tuning, CS.out.vEgo),  # SPRINT35F_STOPREQ_GATE
                                                          _vt_cruise))
         self.accel_last = accel
     else:
