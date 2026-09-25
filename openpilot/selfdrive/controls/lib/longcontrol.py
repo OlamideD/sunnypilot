@@ -58,6 +58,28 @@ SONATA_NOT_BITING_ACCEL = -0.3     # rolling with less deceleration than this un
 SONATA_REAL_BRAKE_CMD = -0.5
 
 
+SONATA_STOP_ENTRY_OFF = '/data/sonata_stop_entry_off'   # SPRINT35G_STOP_ENTRY
+SONATA_STOP_ENTRY_FLOOR = -2.0
+_sonata_entry_off = {'t': -1e9, 'v': False}
+
+
+def sonata_stop_entry_accel(last_output_accel, a_target, v_ego, a_ego):
+  """SPRINT35G_STOP_ENTRY: the command on the tick LongControl enters `stopping`. While still rolling, continue the
+  deceleration already in progress - never restart the ramp from 0 (#311: +1.557 -> 0 -> car accelerated)."""
+  import time as _t
+  now = _t.monotonic()
+  if now - _sonata_entry_off['t'] > 1.0:
+    _sonata_entry_off['t'] = now
+    _sonata_entry_off['v'] = _sonata_os.path.exists(SONATA_STOP_ENTRY_OFF)
+  if _sonata_entry_off['v'] or v_ego <= 0.05:
+    return last_output_accel
+  try:
+    start = min(float(last_output_accel), float(a_target), float(a_ego), 0.0)
+  except Exception:
+    return last_output_accel
+  return max(start, SONATA_STOP_ENTRY_FLOOR)
+
+
 def sonata_stopping_rate(v_ego, a_ego=None, cmd=None):
   if _sonata_smooth_off():
     return 1.0
@@ -117,6 +139,7 @@ class LongControl:
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
 
+    _sonata_prev_state = self.long_control_state   # SPRINT35G_STOP_ENTRY
     self.long_control_state = long_control_state_trans(self.CP_SP, active, self.long_control_state,
                                                        should_stop, CS.brakePressed,
                                                        CS.cruiseState.standstill)
@@ -126,6 +149,8 @@ class LongControl:
 
     elif self.long_control_state == LongCtrlState.stopping:
       output_accel = self.last_output_accel
+      if _sonata_prev_state != LongCtrlState.stopping:   # SPRINT35G_STOP_ENTRY: continue the deceleration in progress
+        output_accel = sonata_stop_entry_accel(output_accel, a_target, CS.vEgo, CS.aEgo)
       if output_accel > self.CP.stopAccel and not sonata_hold_stopping(output_accel, CS.vEgo, CS.aEgo, a_target):   # SPRINT32BG_SMOOTH_STOP
         output_accel = min(output_accel, 0.0)
         # TODO: can we just go straight to stopAccel?

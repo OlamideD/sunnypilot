@@ -1406,6 +1406,9 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
         'launch': self.sonata_launch.info,   # SPRINT32BH_LAUNCH
       })
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates) or self.sonata_stop_latched
+    if (self.sonata_stop_commit_time > 0.0 and not self.sonata_stop_latched
+        and not os.path.exists('/data/sonata_stop_entry_off')):   # SPRINT35G_STOP_ENTRY: never accelerate into a stop being committed
+      output_a_target = min(output_a_target, 0.0)
     if self.sonata_stop_latched:   # SPRINT29A_STANDSTILL_HOLD: hold THROUGH standstill, not only while still rolling
       # Owner, #198: "it kills the speed to zero but doesn't hold it... the car just rolls forward".
       # The old condition (v_ego > SONATA_STOP_COMPLETE_SPEED) dropped this clamp the instant the car
