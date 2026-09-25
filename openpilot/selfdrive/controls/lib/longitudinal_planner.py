@@ -343,6 +343,83 @@ class SonataLaneChangeLong:
     return state == 'lanechangestarting', v_cap
 
 
+# SPRINT36M1_END_OF_ROAD: consumer of the guidance `sonataMapPrep` caps (Sprint 36m map/scene speed preparation:
+# end of road, service roads / parking, ramps, downhill, amber, learned stops). A cap {distanceM, vEndMps, decel,
+# marginM} allows v = sqrt(vEnd^2 + 2*decel*max(d - margin, 0)) now; the lowest joins the SonataRoutePrep MIN.
+# LOWER-ONLY: it can never raise a target; vEnd >= SONATA_36M_MIN_V so it never asks for a stop; the caps never enter
+# signal_info, so the map-stop latch cannot fire on them. Kill switches /data/sonata_36mN_off are honoured here too.
+SONATA_36M_SCHEMA = 'sonata-map-prep-v1'
+SONATA_36M_OFF_FMT = '/data/sonata_%s_off'
+SONATA_36M_FEATURES = ('36m1', '36m2', '36m3', '36m4', '36m5', '36m6')
+SONATA_36M_MAX_DIST_M = 600.0
+SONATA_36M_MIN_V = 0.5
+SONATA_36M_DECEL_MIN = 0.2
+SONATA_36M_DECEL_MAX = 3.0
+
+
+def sonata_36m_cap_target(cap, v_ego, age_s=0.0, low_grip=False):
+  """PURE. Allowed speed now (m/s) for one map-prep cap, or None when the cap is malformed / out of range."""
+  try:
+    d = float(cap['distanceM'])
+    v_end = float(cap['vEndMps'])
+    a = float(cap['decel'])
+    m = float(cap.get('marginM') or 0.0)
+    v = max(float(v_ego), 0.0)
+    age = min(max(float(age_s), 0.0), SONATA_ROUTE_STALE_S)
+  except Exception:
+    return None
+  if not all(math.isfinite(x) for x in (d, v_end, a, m, v, age)) or a <= 0.0 or v_end <= 0.0:
+    return None
+  v_end = max(v_end, SONATA_36M_MIN_V)
+  a = min(max(a, SONATA_36M_DECEL_MIN), SONATA_36M_DECEL_MAX) * (SONATA_GRIP_PREP_DECEL_SCALE if low_grip else 1.0)
+  d = d - v * age                  # the guidance record is up to SONATA_ROUTE_STALE_S old: we are that much closer
+  if d > SONATA_36M_MAX_DIST_M:
+    return None
+  d_eff = max(d - max(m, 0.0), 0.0)
+  return max((v_end * v_end + 2.0 * a * d_eff) ** 0.5, v_end)
+
+
+def sonata_36m_consume(rp, now, v_ego, s):
+  """SPRINT36M1: the lowest map-prep cap for this frame (m/s) or None. Writes rp.info['mapPrep']. Never raises."""
+  st = getattr(rp, '_s36m', None)
+  if st is None:
+    st = rp._s36m = {'off_t': -1e9, 'off': frozenset()}
+  info = {'active': False, 'vTarget': None, 'reason': 'no map prep', 'feature': None, 'kind': None, 'distM': None, 'n': 0}
+  best = None
+  try:
+    mp = s.get('sonataMapPrep') if isinstance(s, dict) else None
+    if not isinstance(mp, dict) or mp.get('schema') != SONATA_36M_SCHEMA:
+      pass
+    elif rp._file_age > SONATA_ROUTE_STALE_S:
+      info['reason'] = 'stale'
+    elif not isinstance(s.get('gpsAgeS'), (int, float)) or s.get('gpsAgeS') > SONATA_ROUTE_GPS_MAX_AGE_S:
+      info['reason'] = 'gps_age'
+    else:
+      if now - st['off_t'] >= 1.0:
+        st['off_t'] = now
+        st['off'] = frozenset(f for f in SONATA_36M_FEATURES if os.path.exists(SONATA_36M_OFF_FMT % f))
+      caps = [c for c in (mp.get('caps') or []) if isinstance(c, dict)]
+      info['n'] = len(caps)
+      info['reason'] = 'no cap'
+      for c in caps:
+        if c.get('feature') not in SONATA_36M_FEATURES or c.get('feature') in st['off']:
+          continue
+        v = sonata_36m_cap_target(c, v_ego, rp._file_age, bool(getattr(rp, '_low_grip', False)))
+        if v is not None and (best is None or v < best[0]):
+          best = (v, c)
+      if best is not None:
+        info.update(active=True, vTarget=best[0], reason='ok', feature=best[1].get('feature'),
+                    kind=best[1].get('kind'), distM=best[1].get('distanceM'))
+  except Exception:
+    best = None
+    info['reason'] = 'error'
+  try:
+    rp.info['mapPrep'] = info
+  except Exception:
+    pass
+  return best[0] if best is not None else None
+
+
 class SonataRoutePrep:
   """Polls the guidance state (<= 4 Hz) and returns the route speed cap for this frame."""
   def __init__(self, path=SONATA_ROUTE_STATE):
@@ -486,6 +563,10 @@ class SonataRoutePrep:
     self.signal_info = {'active': v_signal is not None, 'reason': signal_reason, 'kind': control.get('kind'),
                         'distM': control.get('distanceM'), 'source': control.get('source'), 'vTarget': v_signal,
                         'served': bool(self._stop_served)}   # SPRINT35_STOP_CAP_CONTINUITY
+    # SPRINT36M1_END_OF_ROAD: the Sprint 36m map/scene caps (guidance sonataMapPrep), lower-only.
+    _v36m = sonata_36m_consume(self, now, v_ego, s)
+    if _v36m is not None and (v_signal is None or _v36m < v_signal):
+      v_signal = _v36m
     if v_signal is not None and (v_target is None or v_signal < v_target):
       return v_signal
     return v_target
