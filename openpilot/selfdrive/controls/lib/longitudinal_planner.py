@@ -645,6 +645,47 @@ def sonata_route_exec_read(path, now_mono, boot_id):
   return out
 
 
+# SPRINT36C1_ROUGH_ROAD: learned speed bump / pothole / rough-road cap published by the lane planner daemon
+# (/data/sonata-lane-planner.py, Sprint 36c1). LOWER-ONLY like every other Sonata cap: admitted only when the record
+# is from THIS boot, at most SONATA_ROUGH_FRESH_S old (monotonic clock shared with the daemon), marked actuates, and
+# finite; floored at SONATA_ROUGH_MIN_V so it can slow the car but never stop it. /data/sonata_36c1_off ignores it.
+SONATA_ROUGH_CAP = '/data/sonata_telemetry/rough_road_cap.json'
+SONATA_ROUGH_OFF = '/data/sonata_36c1_off'
+SONATA_ROUGH_FRESH_S = 0.6
+SONATA_ROUGH_MIN_V = 4.0          # m/s (14 km/h)
+_sonata_rough = {'off_t': -1e9, 'off': False}
+
+
+def sonata_rough_road_cap(path, now_mono, boot_id):
+  """SPRINT36C1_ROUGH_ROAD: (vTarget or None, why). PURE apart from one stat and one small file read."""
+  if now_mono - _sonata_rough['off_t'] >= 1.0 or now_mono < _sonata_rough['off_t']:
+    _sonata_rough['off_t'] = now_mono
+    try:
+      _sonata_rough['off'] = os.path.exists(SONATA_ROUGH_OFF)
+    except Exception:
+      _sonata_rough['off'] = False
+  if _sonata_rough['off']:
+    return None, 'kill switch'
+  try:
+    with open(path) as fh:
+      d = json.load(fh)
+  except Exception:
+    return None, 'no file'
+  if not isinstance(d, dict) or d.get('schema') != 'sonata-rough-road-cap-v1':
+    return None, 'bad schema'
+  if not boot_id or d.get('bootId') != boot_id:
+    return None, 'boot mismatch'
+  mono = d.get('mono')
+  if not isinstance(mono, (int, float)) or not math.isfinite(mono) or not 0.0 <= now_mono - mono <= SONATA_ROUGH_FRESH_S:
+    return None, 'stale'
+  if d.get('actuates') is not True:
+    return None, 'not actuating'
+  vt = d.get('vTarget')
+  if not isinstance(vt, (int, float)) or not math.isfinite(vt) or vt < 0.0:
+    return None, 'no target'
+  return max(float(vt), SONATA_ROUGH_MIN_V), str(d.get('why') or 'rough road')[:60]
+
+
 def sonata_capability_cap(caps, v_ego):
   """PURE. Lowest lower-only cruise cap the enabled longitudinal capabilities ask for.
 
@@ -1810,6 +1851,10 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       self.sonata_cap_v, self.sonata_cap_why = None, 'capabilities unreadable'
     if self.sonata_cap_v is not None and self.sonata_cap_v < v_cruise:
       v_cruise = self.sonata_cap_v
+    # SPRINT36C1_ROUGH_ROAD: learned bump / pothole / rough-road cap from the lane planner daemon (lower-only)
+    self.sonata_rough_v, self.sonata_rough_why = sonata_rough_road_cap(SONATA_ROUGH_CAP, time.monotonic(), SONATA_BOOT_ID)
+    if self.sonata_rough_v is not None and self.sonata_rough_v < v_cruise:
+      v_cruise = self.sonata_rough_v
     # SPRINT36P3_NO_PASS_RIGHT: a slower car in the left lane caps us at its speed + 5 km/h (lower-only, coast rate).
     _npr_cap = self.sonata_npr.update(_r36_now, _r36_snap, v_ego, _r36_lc)
     v_cruise = sonata_npr_apply(v_cruise, _npr_cap, v_ego)
@@ -1974,6 +2019,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
         'curvePrepFloor': float(SONATA_CRUISE_MIN[0]),
         'routePrep': self.sonata_route_prep.info,
         'capabilityCap': {'vTarget': self.sonata_cap_v, 'why': self.sonata_cap_why},   # SPRINT31B
+        'roughRoad': {'vTarget': getattr(self, 'sonata_rough_v', None), 'why': getattr(self, 'sonata_rough_why', None)},   # SPRINT36C1_ROUGH_ROAD
         'routeExec': {'requested': self.sonata_rx.get('requested'), 'admitted': bool(self.sonata_rx.get('admitted')),   # SPRINT32D_ROUTE_EXEC
                       'why': self.sonata_rx.get('why'), 'state': self.sonata_rx.get('state'),
                       'capConsumed': bool(self.sonata_rx_cap_used), 'stopConsumed': bool(self.sonata_rx_stop_used)},

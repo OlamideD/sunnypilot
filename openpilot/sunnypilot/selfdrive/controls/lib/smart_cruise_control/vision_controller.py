@@ -179,6 +179,35 @@ def sonata_grip_low():
   return _sonata_grip["low"]
 
 
+# SPRINT36C3_NIGHT: conditions curve-budget scale (36c3 night, 36c4 rain) published by the lane planner daemon in
+# grip_live.json as "curveScale" - the same file the low-grip scale above already comes from. LOWER-ONLY: clamped to
+# [SONATA_COND_SCALE_MIN, 1.0]; missing, unreadable or older than 30 s = 1.0 (today's behaviour). It multiplies the
+# base budget and the learned budget, exactly where the low-grip scale acts; the 35a authority ceiling stays a min().
+SONATA_COND_SCALE_MIN = 0.80
+_sonata_cond = {"check": -1e9, "mtime": None, "scale": 1.0}
+
+
+def sonata_conditions_curve_scale():
+  now = time.monotonic()
+  if now - _sonata_cond["check"] >= 1.0 or now < _sonata_cond["check"]:
+    _sonata_cond["check"] = now
+    try:
+      import os, json
+      st = os.stat(SONATA_GRIP_LIVE)
+      if st.st_mtime != _sonata_cond["mtime"]:
+        _sonata_cond["mtime"] = st.st_mtime
+        with open(SONATA_GRIP_LIVE) as f:
+          obj = json.load(f)
+        s = obj.get("curveScale", 1.0) if isinstance(obj, dict) else 1.0
+        s = float(s) if isinstance(s, (int, float)) and not isinstance(s, bool) else 1.0
+        _sonata_cond["scale"] = min(1.0, max(SONATA_COND_SCALE_MIN, s)) if np.isfinite(s) else 1.0
+      if time.time() - st.st_mtime > 30.0:
+        _sonata_cond["scale"] = 1.0
+    except Exception:
+      _sonata_cond["scale"] = 1.0
+  return _sonata_cond["scale"]
+
+
 def sonata_learned_budget(kappa, v):
   if sonata_grip_low():
     return None
@@ -238,10 +267,14 @@ def sonata_curve_target_speed(kappa):
   """
   k = max(float(kappa), 1e-4)
   a_base = _A_LAT_REG_MAX * (SONATA_GRIP_LAT_SCALE if sonata_grip_low() else 1.0)  # SPRINT20I_LOW_GRIP
+  _cond = sonata_conditions_curve_scale()   # SPRINT36C3_NIGHT: night / rain budget scale, lower-only (<= 1.0)
+  a_base = a_base * _cond
   v = (a_base / k) ** 0.5
   for _ in range(2):
     v = (a_base * sonata_authority_scale(v) / k) ** 0.5
   learned = sonata_learned_budget(k, v)  # SPRINT20A_LEARNED_CURVE
+  if learned is not None:
+    learned = learned * _cond   # SPRINT36C3_NIGHT: the learned budget is scaled too
   if learned is not None and learned > a_base * sonata_authority_scale(v):
     v = (learned / k) ** 0.5
   if not sonata_authority_ceiling_off():   # SPRINT35A_CURVE_AUTHORITY: lower-only
