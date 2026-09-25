@@ -756,6 +756,18 @@ SONATA_DRIVER_GO_COOLDOWN_S = 4.0  # after the driver's go, do not re-grab the b
 SONATA_CREEP_ALERT_V = 0.12        # held, no gas, and rolling faster than this = the hold is failing
 
 
+# SPRINT36P5_RED_LEAD_GUARD: at a red, a departing lead alone does not end the hold. See hotfix_36p5_red_lead_guard.py.
+SONATA_RED_LEAD_GUARD_OFF = '/data/sonata_36p5_off'
+_SONATA_RLG = {'t': -1e9, 'off': False}
+
+
+def sonata_red_lead_guard_off(now):
+  if now - _SONATA_RLG['t'] > 1.0:
+    _SONATA_RLG['t'] = now
+    _SONATA_RLG['off'] = os.path.exists(SONATA_RED_LEAD_GUARD_OFF)
+  return _SONATA_RLG['off']
+
+
 class SonataStopHoldAuthority:
   """Decides whether a held stop may end, from evidence rather than from the model going quiet."""
 
@@ -838,13 +850,18 @@ class SonataStopHoldAuthority:
     elif self.sign:
       allowed, why = False, 'stop sign: right of way is not perceivable - driver go only'
     elif self.red:
-      allowed = green_ok or departed
-      why = 'green confirmed' if green_ok else ('lead departed' if departed else 'red seen: hold until green, lead, or driver')
+      # SPRINT36P5_RED_LEAD_GUARD: the lead leaving counts only while vision sees green NOW (a right-on-red lead must
+      # not pull us through a red); red/unknown after a red -> green confirmation or the driver.
+      _dep_ok = departed and (sig == 'green' or sonata_red_lead_guard_off(now))
+      allowed = green_ok or _dep_ok
+      why = 'green confirmed' if green_ok else ('lead departed' if _dep_ok else
+            ('red seen: lead left but no green - green or driver only' if departed else 'red seen: hold until green, lead, or driver'))
     else:
       allowed, why = True, 'no red, no sign: model release'
     self.info = {'red': self.red, 'sign': self.sign, 'green': (round(now - self.green_since, 2) if self.green_since else None),
                  'leadDeparted': departed, 'release': why, 'signal': sig, 'creep': creeping,
                  'creepEvents': self.creep_events}
+    self.info['redLeadGuard'] = bool(self.red and not self.sign and departed and not allowed)   # SPRINT36P5_RED_LEAD_GUARD
     return allowed
 
 
@@ -896,6 +913,78 @@ class SonataLaunch:
     return floored
 
 
+# SPRINT36P1_STOP_GAP: stop behind a stationary lead at the owner's gap. See hotfix_36p1_stop_gap.py.
+SONATA_STOP_GAP_OFF = '/data/sonata_36p1_off'
+SONATA_STOP_GAP_TARGET_M = 5.5       # final gap behind a stopped lead (owner median 5.9 m; openpilot today 3.9 m)
+SONATA_STOP_GAP_TAIL_M = 0.4         # LongControl's stopping ramp rolls ~0.3-0.5 m after 0.3 m/s: aim this much further back
+SONATA_STOP_GAP_LOOKAHEAD_S = 0.3    # plan on where the car will be once the brakes respond
+SONATA_STOP_GAP_LEAD_STILL_V = 0.5   # |vLead| at or below this = standing still
+SONATA_STOP_GAP_LEAD_MOVE_V = 1.0    # |vLead| above this = moving: 36p1 lets go at once
+SONATA_STOP_GAP_ARM_S = 0.5          # the lead must stand still this long first
+SONATA_STOP_GAP_MAX_D = 40.0         # m
+SONATA_STOP_GAP_MAX_V = 12.0         # m/s (43 km/h): the final approach of a queue stop, never a highway ghost
+SONATA_STOP_GAP_MIN_V = 0.3          # m/s: below this LongControl's stopping state owns the car
+SONATA_STOP_GAP_DECEL_MAX = 1.5      # m/s^2: the most this feature ever asks for (op median peak decel 1.57)
+SONATA_STOP_GAP_JERK = 1.5           # m/s^3: onset rate, measured from the previous planner output
+SONATA_STOP_GAP_PROB = 0.5           # vision model probability that the lead is real
+SONATA_STOP_GAP_PROB_HOLD_S = 1.0    # ... seen within this long
+SONATA_STOP_GAP_MIN_ROOM = 0.25      # m: floor of the remaining distance in the kinematic formula
+
+
+class SonataStopGap:
+  """Lower-only planner candidate: the even deceleration to rest SONATA_STOP_GAP_TARGET_M behind a stopped lead."""
+
+  def __init__(self):
+    self.still_since = None
+    self.prob_t = -1e9
+    self._off_t = -1e9
+    self._off = False
+    self.info = {'state': 'idle', 'why': 'init', 'aCand': None, 'gapTarget': SONATA_STOP_GAP_TARGET_M}
+
+  def off(self, now):
+    if now - self._off_t > 1.0:
+      self._off_t = now
+      self._off = os.path.exists(SONATA_STOP_GAP_OFF)
+    return self._off
+
+  def _idle(self, why, reset=False):
+    if reset:
+      self.still_since = None
+    self.info = {'state': 'idle', 'why': why, 'aCand': None, 'gapTarget': SONATA_STOP_GAP_TARGET_M}
+    return None
+
+  def update(self, now, dt, v_ego, lead_present, d_rel, v_lead, prob, a_prev, blocked):
+    """Returns a candidate acceleration (m/s^2) or None. The caller min()s it with the other candidates."""
+    try:
+      if blocked:
+        return self._idle('driver / disengaged', True)
+      if self.off(now):
+        return self._idle('kill switch', True)
+      if not lead_present or d_rel is None or v_lead is None or not (math.isfinite(d_rel) and math.isfinite(v_lead)):
+        return self._idle('no lead', True)
+      if abs(v_lead) > SONATA_STOP_GAP_LEAD_MOVE_V:
+        return self._idle('lead moving', True)
+      if prob is not None and math.isfinite(prob) and prob >= SONATA_STOP_GAP_PROB:
+        self.prob_t = now
+      if abs(v_lead) <= SONATA_STOP_GAP_LEAD_STILL_V:
+        self.still_since = now if self.still_since is None else self.still_since
+      if self.still_since is None or now - self.still_since < SONATA_STOP_GAP_ARM_S:
+        return self._idle('lead not yet standing still')
+      if now - self.prob_t > SONATA_STOP_GAP_PROB_HOLD_S:
+        return self._idle('vision does not confirm the lead')
+      if not (SONATA_STOP_GAP_MIN_V <= v_ego <= SONATA_STOP_GAP_MAX_V) or not (0.0 < d_rel <= SONATA_STOP_GAP_MAX_D):
+        return self._idle('outside the final-approach window')
+      room = d_rel - (SONATA_STOP_GAP_TARGET_M + SONATA_STOP_GAP_TAIL_M) - v_ego * SONATA_STOP_GAP_LOOKAHEAD_S
+      a_req = -(v_ego * v_ego) / (2.0 * max(room, SONATA_STOP_GAP_MIN_ROOM))
+      a = max(a_req, -SONATA_STOP_GAP_DECEL_MAX)
+      a = max(a, float(a_prev) - SONATA_STOP_GAP_JERK * dt)
+      self.info = {'state': 'active', 'why': 'stopped lead at %.1f m' % d_rel, 'aCand': round(a, 3),
+                   'aReq': round(a_req, 3), 'gapTarget': SONATA_STOP_GAP_TARGET_M}
+      return float(a)
+    except Exception:
+      return self._idle('error', True)
+
+
 def sonata_coast_limit(a_target, v_ego, has_object, stop_active, fcw, driver_braking, curve_v,
                        plan_source=None, cruise_source=None):
   """Lower-bound the braking authority when nothing is actually in front.
@@ -929,6 +1018,284 @@ def sonata_coast_limit(a_target, v_ego, has_object, stop_active, fcw, driver_bra
   return -SONATA_COAST_DECEL
 
 
+# SPRINT36P2_CUTIN_COAST: a car converging on our lane from the next lane -> coast. See hotfix_36p2_cutin_coast.py.
+# Shared by 36p3/36p4: the radar_live.json reader, our lane edges from the model, and the converging-vehicle watch.
+SONATA_RADAR36_STALE_S = 0.5         # radar_live.json older than this (file mtime) is ignored
+SONATA_RADAR36_POLL_S = 0.04
+SONATA_RADAR_TO_CAMERA_M = 1.52      # radar range -> model frame x
+SONATA_LANE_PROB36 = 0.30            # a lane line below this probability is not used
+SONATA_LANE_WIDTH36 = 3.6            # m: lane width used when only one line of our lane is confident
+SONATA_CONV_WINDOW_S = 0.5           # least-squares window for the gap-closing speed
+SONATA_CONV_SETTLE_V = 0.10          # m/s: closing slower than this ...
+SONATA_CONV_SETTLE_S = 0.6           # ... for this long = settled, let go
+SONATA_CONV_LOST_S = 0.5             # track missing this long = let go
+SONATA_CONV_COOLDOWN_S = 2.0         # a released track cannot re-arm for this long (5 s after a timeout)
+SONATA_CONV_RAMP_J = 1.0             # m/s^3: positive acceleration comes back at this rate after a release
+SONATA_CUTIN_OFF = '/data/sonata_36p2_off'
+SONATA_CUTIN_PARAMS = {'sides': ('left', 'right'), 'x_min': 4.0, 'x_max': 40.0, 'vrel_min': -40.0, 'vrel_max': 0.5,
+                       'toward_min': 0.30, 'vy_min': 0.20, 'hold_s': 0.5, 'v_min': 3.0, 'v_hold': 2.0,
+                       'gap_max': 2.5, 'timeout_s': 5.0}
+
+
+class SonataRadarLive:
+  """mtime-cached reader of the passive radar daemon's /data/sonata_telemetry/radar_live.json. Never raises."""
+
+  def __init__(self, path=SONATA_RADAR_LIVE):
+    self.path = path
+    self._mtime = None
+    self._check = -1e9
+    self.snap = {}
+    self.fresh = False
+
+  def poll(self, now):
+    if now - self._check < SONATA_RADAR36_POLL_S:
+      return
+    self._check = now
+    try:
+      st = os.stat(self.path)
+      if st.st_mtime != self._mtime:
+        self._mtime = st.st_mtime
+        with open(self.path) as f:
+          obj = json.load(f)
+        self.snap = obj if isinstance(obj, dict) else {}
+      self.fresh = (time.time() - st.st_mtime) <= SONATA_RADAR36_STALE_S and not self.snap.get('idle')
+    except Exception:
+      self.snap, self.fresh = {}, False
+
+  def current(self):
+    return self.snap if self.fresh else None
+
+
+def sonata_ego_lane_edges(model):
+  """(left, right) ego-lane lines as (xs, ys) arrays in the model frame (right positive), None when not confident."""
+  out = []
+  try:
+    lines, probs = model.laneLines, model.laneLineProbs
+    for i in (1, 2):
+      if len(lines) > i and len(probs) > i and float(probs[i]) >= SONATA_LANE_PROB36 and len(lines[i].x) >= 2:
+        out.append((np.asarray(lines[i].x, dtype=float), np.asarray(lines[i].y, dtype=float)))
+      else:
+        out.append(None)
+  except Exception:
+    return None, None
+  return out[0], out[1]
+
+
+def sonata_lane_gap(edges, lane, x, y):
+  """Metres from a track in the left/right lane to OUR lane line on that side (positive = still outside), or None."""
+  try:
+    if lane not in ('left', 'right') or edges is None:
+      return None
+    xm = float(x) + SONATA_RADAR_TO_CAMERA_M
+    e = edges[0] if lane == 'left' else edges[1]
+    o = edges[1] if lane == 'left' else edges[0]
+    if e is not None:
+      ye = float(np.interp(xm, e[0], e[1]))
+    elif o is not None:        # only the far line of our lane is confident: a standard lane width from it
+      ye = float(np.interp(xm, o[0], o[1])) + (-SONATA_LANE_WIDTH36 if lane == 'left' else SONATA_LANE_WIDTH36)
+    else:
+      return None
+    return (ye - float(y)) if lane == 'left' else (float(y) - ye)
+  except Exception:
+    return None
+
+
+class SonataConvergeWatch:
+  """Arms when a radar track in an adjacent lane closes the gap to our lane line steadily. Output: clip(a) <= 0."""
+
+  def __init__(self, name, kill, params):
+    self.name, self.kill = name, kill
+    self.p = dict(params)
+    self.hist = {}          # track id -> [(mono, x, gap)]
+    self.cond_since = {}    # track id -> mono the arming condition started
+    self.cool = {}          # track id -> mono until which it cannot re-arm
+    self.rows = {}
+    self.active_id = None
+    self.active_since = None
+    self.settle_since = None
+    self.lost_since = None
+    self.release_t = None
+    self.last_mono = None
+    self.onsets = 0
+    self._off_t, self._off = -1e9, False
+    self.info = {'state': 'idle', 'why': 'init', 'track': None, 'onsets': 0}
+
+  def off(self, now):
+    if now - self._off_t > 1.0:
+      self._off_t = now
+      self._off = os.path.exists(self.kill)
+    return self._off
+
+  @property
+  def active(self):
+    return self.active_id is not None
+
+  @staticmethod
+  def _closing(h, mono):
+    pts = [q for q in h if mono - q[0] <= SONATA_CONV_WINDOW_S + 1e-6]
+    if len(pts) < 4 or pts[-1][0] - pts[0][0] < 0.3:
+      return None
+    n = float(len(pts))
+    mt = sum(q[0] for q in pts) / n
+    mg = sum(q[2] for q in pts) / n
+    den = sum((q[0] - mt) ** 2 for q in pts)
+    if den <= 1e-9:
+      return None
+    return -sum((q[0] - mt) * (q[2] - mg) for q in pts) / den     # positive = the gap to our lane is closing
+
+  def _release(self, why, now, mono, cooldown):
+    if self.active_id is not None:
+      self.cool[self.active_id] = mono + cooldown
+      self.release_t = now
+    self.active_id, self.active_since, self.settle_since, self.lost_since = None, None, None, None
+    self.info = {'state': 'idle', 'why': why, 'track': None, 'onsets': self.onsets}
+
+  def update(self, now, snap, edges, v_ego, lc_active):
+    """now: time.monotonic(); snap: radar_live dict or None when stale; edges: sonata_ego_lane_edges(model).
+    Never raises into plannerd: any error lets go (no clip) and clears the watch."""
+    try:
+      return self._update(now, snap, edges, v_ego, lc_active)
+    except Exception:
+      self.active_id, self.active_since, self.settle_since, self.lost_since = None, None, None, None
+      self.cond_since, self.hist, self.rows = {}, {}, {}
+      self.info = {'state': 'idle', 'why': 'error', 'track': None, 'onsets': self.onsets}
+      return False
+
+  def _update(self, now, snap, edges, v_ego, lc_active):
+    p = self.p
+    gate = None
+    if self.off(now):
+      gate = 'kill switch'
+    elif lc_active:
+      gate = 'our lane change'
+    elif snap is None:
+      gate = 'radar stale'
+    elif v_ego < p['v_hold']:
+      gate = 'slow'
+    if gate is not None:
+      if self.active_id is not None:
+        self._release(gate, now, self.last_mono or 0.0, SONATA_CONV_COOLDOWN_S)
+      if gate != 'slow':
+        self.cond_since.clear()
+      self.info = {'state': 'idle', 'why': gate, 'track': None, 'onsets': self.onsets}
+      return False
+    try:
+      mono = float(snap.get('mono'))
+    except Exception:
+      return self.active
+    if mono != self.last_mono:
+      self._ingest(snap, edges, v_ego, mono)
+      self.last_mono = mono
+    was_active = self.active_id is not None
+    if self.active_id is not None:
+      r = self.rows.get(self.active_id)
+      why, cool = None, SONATA_CONV_COOLDOWN_S
+      if r is None:
+        self.lost_since = mono if self.lost_since is None else self.lost_since
+        if mono - self.lost_since > SONATA_CONV_LOST_S:
+          why = 'track lost'
+      else:
+        self.lost_since = None
+        x, lane, gap, closing, vrel = r
+        if lane == 'ego' or (gap is not None and gap <= 0.0):
+          why = 'in our lane - the planner lead now'
+        elif x < 0.5 or x > p['x_max'] + 10.0:
+          why = 'out of range'
+        elif vrel > p['vrel_max'] + 1.5:
+          why = 'pulling away'
+        elif closing is not None and closing < SONATA_CONV_SETTLE_V:
+          self.settle_since = mono if self.settle_since is None else self.settle_since
+          if mono - self.settle_since >= SONATA_CONV_SETTLE_S:
+            why = 'settled'
+        else:
+          self.settle_since = None
+      if why is None and now - self.active_since > p['timeout_s']:
+        why, cool = 'timeout', 5.0
+      if why is not None:
+        self._release(why, now, mono, cool)
+      else:
+        self.info = {'state': 'active', 'why': 'converging', 'onsets': self.onsets,
+                     'track': self._track_info(self.active_id)}
+    if self.active_id is None and v_ego >= p['v_min']:
+      best, bx = None, 1e9
+      for tid, since in self.cond_since.items():
+        r = self.rows.get(tid)
+        if r is not None and mono - since >= p['hold_s'] and self.cool.get(tid, -1e9) <= mono and r[0] < bx:
+          best, bx = tid, r[0]
+      if best is not None:
+        self.active_id, self.active_since, self.settle_since, self.lost_since = best, now, None, None
+        self.release_t = None
+        self.onsets += 1
+        self.info = {'state': 'active', 'why': 'converging', 'onsets': self.onsets, 'track': self._track_info(best)}
+      elif not was_active:
+        self.info = {'state': 'idle', 'why': 'watching %d' % len(self.cond_since), 'track': None, 'onsets': self.onsets}
+    return self.active
+
+  def _track_info(self, tid):
+    r = self.rows.get(tid)
+    if r is None:
+      return {'id': tid}
+    return {'id': tid, 'x': round(r[0], 1), 'lane': r[1], 'gap': (round(r[2], 2) if r[2] is not None else None),
+            'closing': (round(r[3], 2) if r[3] is not None else None), 'vRel': round(r[4], 2)}
+
+  def _ingest(self, snap, edges, v_ego, mono):
+    p = self.p
+    rows = {}
+    for r in (snap.get('tracks') or []):
+      try:
+        tid, x, y = int(r['id']), float(r['x']), float(r['y'])
+        vrel, vy = float(r.get('vRel') or 0.0), float(r.get('vy') or 0.0)
+        lane, motion = str(r.get('lane')), int(r.get('motion') or 0)
+      except Exception:
+        continue
+      h = self.hist.get(tid)
+      if h and (mono - h[-1][0] > 0.35 or abs(x - h[-1][1]) > 10.0):
+        h = None                              # a different object on a reused track id
+        self.cond_since.pop(tid, None)
+      h = h or []
+      gap = sonata_lane_gap(edges, lane, x, y)
+      if gap is not None:
+        h.append((mono, x, gap))
+        del h[:-12]
+      self.hist[tid] = h
+      closing = self._closing(h, mono) if gap is not None else None
+      rows[tid] = (x, lane, gap, closing, vrel)
+      toward_vy = vy if lane == 'left' else -vy
+      vabs = v_ego + vrel
+      cond = (lane in p['sides'] and motion != 1 and gap is not None and 0.0 < gap <= p['gap_max']
+              and p['x_min'] <= x <= p['x_max'] and p['vrel_min'] <= vrel <= p['vrel_max']
+              and vabs >= max(2.0, 0.3 * v_ego) and closing is not None and closing >= p['toward_min']
+              and toward_vy >= p['vy_min']
+              # it can reach our lane before we draw level with it (a car we are passing cannot cut in front)
+              and (vrel >= -0.1 or gap / max(closing, 0.05) <= (x - 1.0) / -vrel))
+      if cond:
+        self.cond_since.setdefault(tid, mono)
+      else:
+        self.cond_since.pop(tid, None)
+    for tid in list(self.hist):
+      if tid not in rows and (not self.hist[tid] or mono - self.hist[tid][-1][0] > 1.0):
+        del self.hist[tid]
+        self.cond_since.pop(tid, None)
+    for tid in list(self.cool):
+      if self.cool[tid] < mono - 10.0:
+        del self.cool[tid]
+    self.rows = rows
+
+  def clip(self, a, now):
+    """Lower-only: <= 0 while armed, then positive acceleration ramps back in at SONATA_CONV_RAMP_J."""
+    if not (a == a):          # NaN in: hand it back untouched (the planner's own np.clip deals with it as before)
+      return a
+    if self.active_id is not None:
+      return min(a, 0.0)
+    if self.release_t is not None:
+      cap = (now - self.release_t) * SONATA_CONV_RAMP_J
+      if cap >= ACCEL_MAX:
+        self.release_t = None
+        return a
+      return min(a, cap)
+    return a
+
+
 def sonata_vision_physical_target(vision):
   """SPRINT16H_PHYSICAL_CURVE_FLOOR: the curve speed the geometry allows (sqrt(a_lat_max / kappa)),
   not output_v_target, which already subtracts 4 s of deceleration and inflates the gap."""
@@ -941,6 +1308,104 @@ def sonata_vision_physical_target(vision):
     return v
   except Exception:
     return None
+
+
+# SPRINT36P3_NO_PASS_RIGHT: do not overtake a slower car on its right. See hotfix_36p3_no_pass_right.py.
+SONATA_NPR_OFF = '/data/sonata_36p3_off'
+SONATA_NPR_V_ARM = 60.0 / 3.6        # m/s: only above 60 km/h
+SONATA_NPR_V_HOLD = 57.0 / 3.6       # ... held down to 57 km/h once armed
+SONATA_NPR_MARGIN = 5.0 / 3.6        # cap = the left car's speed + 5 km/h
+SONATA_NPR_LEFT_V_MIN = SONATA_NPR_V_ARM - SONATA_NPR_MARGIN   # left cars slower than 55 km/h are not "traffic we pass"
+SONATA_NPR_X_MIN = 3.0               # m ahead (front radar)
+SONATA_NPR_X_MAX = 60.0
+SONATA_NPR_ARM_S = 1.0               # a left car must be seen this long before it caps us
+SONATA_NPR_RELEASE_S = 1.0           # ... and gone this long before the cap lets go
+SONATA_NPR_COAST = 0.45              # m/s of cruise error = m/s^2: the cap is approached at coast rate at most
+
+
+class SonataNoPassRight:
+  """Lower-only cruise cap: the slowest same-direction car in the left lane ahead + 5 km/h."""
+
+  def __init__(self):
+    self.since = {}          # track id -> mono first seen qualifying (continuously)
+    self.cap = None
+    self.last_ok_t = None
+    self.target = None
+    self.onsets = 0
+    self._off_t, self._off = -1e9, False
+    self.info = {'state': 'idle', 'why': 'init', 'vCap': None, 'left': None, 'onsets': 0}
+
+  def off(self, now):
+    if now - self._off_t > 1.0:
+      self._off_t = now
+      self._off = os.path.exists(SONATA_NPR_OFF)
+    return self._off
+
+  def _idle(self, why):
+    self.cap, self.last_ok_t, self.target = None, None, None
+    self.info = {'state': 'idle', 'why': why, 'vCap': None, 'left': None, 'onsets': self.onsets}
+    return None
+
+  def update(self, now, snap, v_ego, lc_active):
+    """Returns the cruise cap (m/s) or None. The caller applies min(v_cruise, cap) and the coast-rate floor."""
+    try:
+      if self.off(now):
+        self.since.clear()
+        return self._idle('kill switch')
+      if lc_active:
+        self.since.clear()
+        return self._idle('our lane change')
+      if snap is None:
+        self.since.clear()
+        return self._idle('radar stale')
+      if v_ego < (SONATA_NPR_V_HOLD if self.cap is not None else SONATA_NPR_V_ARM):
+        self.since.clear()
+        return self._idle('below 60 km/h')
+      left_lane = ((snap.get('lanes') or {}).get('left') or {})
+      if not left_lane.get('exists'):
+        self.since.clear()
+        return self._idle('no left lane (leftmost lane)')
+      mono = float(snap.get('mono'))
+      best = None
+      seen = set()
+      for r in (snap.get('tracks') or []):
+        try:
+          tid, x, vrel, lane, motion = int(r['id']), float(r['x']), float(r.get('vRel') or 0.0), str(r.get('lane')), int(r.get('motion') or 0)
+        except Exception:
+          continue
+        vabs = v_ego + vrel
+        ok = (lane == 'left' and motion != 1 and SONATA_NPR_X_MIN <= x <= SONATA_NPR_X_MAX
+              and vabs >= SONATA_NPR_LEFT_V_MIN and vabs >= 0.5 * v_ego)
+        if not ok:
+          continue
+        seen.add(tid)
+        since = self.since.setdefault(tid, mono)
+        if mono - since >= SONATA_NPR_ARM_S and (best is None or vabs < best[1]):
+          best = (tid, vabs, x)
+      for tid in list(self.since):
+        if tid not in seen:
+          del self.since[tid]
+      if best is not None:
+        cap = best[1] + SONATA_NPR_MARGIN
+        if self.cap is None:
+          self.onsets += 1
+        self.cap, self.last_ok_t, self.target = cap, now, best
+        self.info = {'state': 'capped', 'why': 'car in the left lane', 'vCap': round(cap, 2), 'onsets': self.onsets,
+                     'left': {'id': best[0], 'v': round(best[1], 2), 'x': round(best[2], 1)}}
+        return cap
+      if self.cap is not None and self.last_ok_t is not None and now - self.last_ok_t < SONATA_NPR_RELEASE_S:
+        self.info['why'] = 'left car gone - holding %.1f s' % SONATA_NPR_RELEASE_S
+        return self.cap
+      return self._idle('no slower car in the left lane')
+    except Exception:
+      return self._idle('error')
+
+
+def sonata_npr_apply(v_cruise, cap, v_ego):
+  """min(v_cruise, cap), but never more than SONATA_NPR_COAST below the current speed: shed speed by coasting."""
+  if cap is None:
+    return v_cruise
+  return min(v_cruise, max(cap, v_ego - SONATA_NPR_COAST))
 
 
 def sonata_curve_prep_floor(vision_active, v_target, v_ego):
@@ -959,6 +1424,13 @@ def sonata_curve_prep_floor(vision_active, v_target, v_ego):
     return float(np.interp(gap, SONATA_CURVE_PREP_GAP_BP, [A_CRUISE_MIN, _deepest]))
   except Exception:
     return A_CRUISE_MIN
+
+
+# SPRINT36P4_MERGE_COURTESY: a car merging from the right on the highway -> coast. See hotfix_36p4_merge_courtesy.py.
+SONATA_MERGE_OFF = '/data/sonata_36p4_off'
+SONATA_MERGE_PARAMS = {'sides': ('right',), 'x_min': 1.0, 'x_max': 30.0, 'vrel_min': -5.0, 'vrel_max': 3.0,
+                       'toward_min': 0.20, 'vy_min': 0.10, 'hold_s': 0.6, 'v_min': 60.0 / 3.6, 'v_hold': 55.0 / 3.6,
+                       'gap_max': 2.5, 'timeout_s': 6.0}
 
 
 def sonata_model_horizon(model):
@@ -1150,15 +1622,20 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     self.sonata_map_stop_pending = False   # SPRINT23D_MAP_STOP_LATCH
     self.sonata_stop_queue = SonataStopQueue()   # SPRINT33U_STOP_QUEUE
     self.sonata_hold_auth = SonataStopHoldAuthority()   # SPRINT34B_HOLD_UNTIL_EVIDENCE
+    self.sonata_stop_gap = SonataStopGap()   # SPRINT36P1_STOP_GAP
     self.sonata_driver_go_until = 0.0
     self.sonata_map_stop_cooldown_until = 0.0
     self.sonata_admit = (False, 'init')
     self.sonata_planner_live_t = 0.0
     self.sonata_route_prep = SonataRoutePrep()
+    self.sonata_merge = SonataConvergeWatch('merge', SONATA_MERGE_OFF, SONATA_MERGE_PARAMS)   # SPRINT36P4_MERGE_COURTESY
     self.sonata_cap_v = None            # SPRINT31B_CAPABILITY_CAPS
     self.sonata_cap_why = 'not evaluated'
     self.sonata_lane_long = SonataLaneChangeLong()  # SPRINT19_LANE_CHANGE_LONG
+    self.sonata_radar36 = SonataRadarLive()   # SPRINT36P2_CUTIN_COAST (shared with 36p3/36p4)
+    self.sonata_cutin = SonataConvergeWatch('cutin', SONATA_CUTIN_OFF, SONATA_CUTIN_PARAMS)   # SPRINT36P2_CUTIN_COAST
     self.sonata_personality = SonataPersonalityFile()  # SPRINT20B_TRAFFIC_MODE
+    self.sonata_npr = SonataNoPassRight()   # SPRINT36P3_NO_PASS_RIGHT
     self.sonata_max_accel_scale = 1.0
     self.sonata_route_v = None
     self.sonata_curve_v = None
@@ -1224,6 +1701,14 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       self.sonata_route_v = None
     if sonata_lc_v is not None and sonata_lc_v < v_cruise:
       v_cruise = sonata_lc_v
+    # SPRINT36P2_CUTIN_COAST: passive radar tracks -> converging-vehicle watch (the clip is applied at the output).
+    _r36_now = time.monotonic()
+    self.sonata_radar36.poll(_r36_now)
+    _r36_snap = self.sonata_radar36.current()
+    _r36_edges = sonata_ego_lane_edges(sm['modelV2'])
+    _r36_lc = str(self.sonata_lane_long.info.get('state', 'off')) != 'off'
+    self.sonata_cutin.update(_r36_now, _r36_snap, _r36_edges, v_ego, _r36_lc)
+    self.sonata_merge.update(_r36_now, _r36_snap, _r36_edges, v_ego, _r36_lc)   # SPRINT36P4_MERGE_COURTESY
     # SPRINT33U_STOP_QUEUE: second in line at a stop sign - roll up to the line, do not launch at it.
     _q_lead = sm['radarState'].leadOne
     _q_v = self.sonata_stop_queue.update(
@@ -1244,6 +1729,9 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       self.sonata_cap_v, self.sonata_cap_why = None, 'capabilities unreadable'
     if self.sonata_cap_v is not None and self.sonata_cap_v < v_cruise:
       v_cruise = self.sonata_cap_v
+    # SPRINT36P3_NO_PASS_RIGHT: a slower car in the left lane caps us at its speed + 5 km/h (lower-only, coast rate).
+    _npr_cap = self.sonata_npr.update(_r36_now, _r36_snap, v_ego, _r36_lc)
+    v_cruise = sonata_npr_apply(v_cruise, _npr_cap, v_ego)
     # SPRINT32D_ROUTE_EXEC_CAP: the surveyed-course route executor (/data/sonata-route-exec.py). Lower-only cruise cap,
     # admitted only when boot-bound, <=0.3 s old and marked actuates. Requested/admitted/consumed all go to
     # planner_live.routeExec (DEVICE_HANDOFF S4: a heartbeat is not proof of control use; this is).
@@ -1376,6 +1864,15 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
     if self.sonata_rx['shouldStop'] and self.sonata_rx['aTarget'] is not None:
       candidates.append((float(self.sonata_rx['aTarget']), LongitudinalPlanSource.e2e, v_ego <= SONATA_STOP_COMMIT_SPEED))
 
+    # SPRINT36P1_STOP_GAP: a stopped lead -> the even deceleration to rest at the owner's gap (lower-only candidate).
+    _sg_lead = sm['radarState'].leadOne
+    _sg_a = self.sonata_stop_gap.update(sonata_now, self.dt, v_ego, bool(_sg_lead.present),
+                                        (float(_sg_lead.dRel) if _sg_lead.present else None),
+                                        (float(_sg_lead.vLead) if _sg_lead.present else None),
+                                        (float(_sg_lead.modelProb) if _sg_lead.present else None),
+                                        float(a_prev), bool(sm['carState'].gasPressed) or bool(reset_state))
+    if _sg_a is not None:
+      candidates.append((_sg_a, LongitudinalPlanSource.lead0, False))
     output_a_target, self.mpc.source, _ = min(candidates, key=lambda c: c[0])
     self.sonata_rx_stop_used = bool(self.sonata_rx['shouldStop'] and self.sonata_rx['aTarget'] is not None
                                     and output_a_target == float(self.sonata_rx['aTarget']))   # SPRINT32D_ROUTE_EXEC
@@ -1401,9 +1898,13 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
                       'capConsumed': bool(self.sonata_rx_cap_used), 'stopConsumed': bool(self.sonata_rx_stop_used)},
         'signalPrep': self.sonata_route_prep.signal_info,
         'laneChangeLong': self.sonata_lane_long.info,
+        'cutInCoast': self.sonata_cutin.info,   # SPRINT36P2_CUTIN_COAST
         'personality': self.sonata_personality.info,
+        'noPassRight': self.sonata_npr.info,   # SPRINT36P3_NO_PASS_RIGHT
         'curveVTarget': self.sonata_curve_v,
+        'mergeCourtesy': self.sonata_merge.info,   # SPRINT36P4_MERGE_COURTESY
         'launch': self.sonata_launch.info,   # SPRINT32BH_LAUNCH
+        'stopGap': self.sonata_stop_gap.info,   # SPRINT36P1_STOP_GAP
       })
     self.output_should_stop = any(should_stop for _, _, should_stop in candidates) or self.sonata_stop_latched
     if (self.sonata_stop_commit_time > 0.0 and not self.sonata_stop_latched
@@ -1422,6 +1923,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
                                                 bool(sm['carState'].gasPressed), bool(sm['carState'].brakePressed),
                                                 bool(self.sonata_stop_latched) or bool(self.sonata_stop_queue.creeping),   # SPRINT33U_STOP_QUEUE
                                                 (float(_launch_lead.dRel) if _launch_lead.present else None), float(output_a_target_e2e), float(ACCEL_MAX))
+    output_a_target = self.sonata_cutin.clip(output_a_target, time.monotonic())   # SPRINT36P2_CUTIN_COAST: coast, never brake
     # SPRINT31O_COAST_NOT_BRAKE: anticipatory braking with nothing in front is limited to coast authority.
     # Objects, stops, FCW, the driver's own brake and a genuine over-speed for the curve geometry
     # all keep full authority - see sonata_coast_limit.
@@ -1438,6 +1940,7 @@ class LongitudinalPlanner(LongitudinalPlannerSP):
       self.mpc.source,
       LongitudinalPlanSource.cruise,
     )
+    output_a_target = self.sonata_merge.clip(output_a_target, time.monotonic())   # SPRINT36P4_MERGE_COURTESY: coast, never brake
     self.output_a_target = np.clip(output_a_target, ACCEL_MIN, ACCEL_MAX)
 
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
