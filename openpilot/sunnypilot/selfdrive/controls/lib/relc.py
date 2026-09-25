@@ -20,6 +20,19 @@ MIN_SPEED = 20 * CV.MPH_TO_MS
 VEHICLE_EDGE_MARGIN = 1.08
 EDGE_CLEARANCE = 3.7
 
+# SPRINT36L2_BSM_ABORT: same-frame, read-only hand-off of the ego lane lines to DesireHelper (modeld calls
+# update_and_fill immediately before DH.update). seq advances once per frame; values are None on any error.
+SONATA_EGO_LINES = {"seq": 0, "left": None, "right": None, "lpLeft": None, "lpRight": None}
+
+
+def sonata_stash_ego_lines(modelv2):
+  try:
+    ll, lp = modelv2.laneLines, modelv2.laneLineProbs
+    SONATA_EGO_LINES.update(left=float(ll[1].y[0]), right=float(ll[2].y[0]), lpLeft=float(lp[1]), lpRight=float(lp[2]))
+  except Exception:
+    SONATA_EGO_LINES.update(left=None, right=None, lpLeft=None, lpRight=None)
+  SONATA_EGO_LINES["seq"] = SONATA_EGO_LINES["seq"] + 1
+
 
 def valid_number(value):
   return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(value)
@@ -110,6 +123,7 @@ class RoadEdgeLaneChangeController:
 
   def update_and_fill(self, modelv2, mdv2sp, v_ego):
     self.update(modelv2.roadEdgeStds, modelv2.laneLineProbs, v_ego, modelv2.roadEdges)
+    sonata_stash_ego_lines(modelv2)   # SPRINT36L2_BSM_ABORT
     mdv2sp.leftLaneChangeEdgeBlock = self.left_edge_detected
     mdv2sp.rightLaneChangeEdgeBlock = self.right_edge_detected
     return self.left_edge_detected, self.right_edge_detected
