@@ -1664,12 +1664,50 @@ class SonataStopSignCompletion:
     return False
 
 
-def sonata_write_planner_live(path, payload):
+def _sonata_write_planner_live_now(path, payload):
   try:
     tmp = path + '.tmp'
     with open(tmp, 'w') as f:
       json.dump(payload, f, separators=(',', ':'))
     os.replace(tmp, path)
+  except Exception:
+    pass
+
+
+import threading as _sonata_threading   # SPRINT36T4_ASYNC_LIVE
+_SONATA_LIVE = {'cv': _sonata_threading.Condition(), 'job': None, 'thread': None, 'sync_t': -1e9, 'sync': False}
+SONATA_PLANNER_LIVE_SYNC = '/data/sonata_planner_live_sync'
+
+
+def _sonata_planner_live_writer():
+  st = _SONATA_LIVE
+  while True:
+    with st['cv']:
+      while st['job'] is None:
+        st['cv'].wait()
+      path, payload = st['job']
+      st['job'] = None
+    _sonata_write_planner_live_now(path, payload)
+
+
+def sonata_write_planner_live(path, payload):
+  """SPRINT36T4_ASYNC_LIVE: hand the latest payload to a background writer - the planning loop never blocks on /data."""
+  try:
+    st = _SONATA_LIVE
+    import time as _t
+    now = _t.monotonic()
+    if now - st['sync_t'] > 5.0:
+      st['sync_t'] = now
+      st['sync'] = os.path.exists(SONATA_PLANNER_LIVE_SYNC)
+    if st['sync']:
+      _sonata_write_planner_live_now(path, payload)
+      return
+    with st['cv']:
+      st['job'] = (path, payload)   # latest wins
+      if st['thread'] is None or not st['thread'].is_alive():
+        st['thread'] = _sonata_threading.Thread(target=_sonata_planner_live_writer, daemon=True, name='sonata-live-writer')
+        st['thread'].start()
+      st['cv'].notify()
   except Exception:
     pass
 
