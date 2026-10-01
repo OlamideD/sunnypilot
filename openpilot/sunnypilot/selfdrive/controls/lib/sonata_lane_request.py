@@ -14,6 +14,8 @@ import os
 import time
 
 LANE_PLANNER = "/data/sonata_telemetry/lane_planner.json"
+# SPRINT36T9_MODELD_IO: True once the background thread owns every poll and write (see sonata_io_start)
+_SONATA_IO = {"on": False, "started": False}
 POLL_S = 0.10
 MAX_AGE_S = 1.5
 
@@ -54,7 +56,8 @@ class SonataLaneRequest:
 
   def active(self, now: float | None = None) -> str | None:
     now = time.monotonic() if now is None else now
-    self.poll(now)
+    if not _SONATA_IO["on"]:   # SPRINT36T9_MODELD_IO
+      self.poll(now)
     return self.direction if self.direction and now < self.until else None
 
 
@@ -124,7 +127,8 @@ class SonataTurnIntent:
   def side(self, cs, now: float | None = None) -> str | None:
     """The blinker side to hide from DesireHelper this frame, or None."""
     now = time.monotonic() if now is None else now
-    self.poll(now)
+    if not _SONATA_IO["on"]:   # SPRINT36T9_MODELD_IO
+      self.poll(now)
     left, right = bool(cs.leftBlinker), bool(cs.rightBlinker)
     if not (left or right) or (left and right):
       self.masked = None
@@ -192,16 +196,14 @@ def _route_turn_shadow(cs, side):
       why = "turn_desire_sent"
     row = {"utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "routeSide": _TURN.route_side, "signal": blink,
            "masked": side, "vEgo": round(v, 2), "ceilingV": round(SONATA_TURN_CEILING_V, 2), "bsm": bsm, "outcome": why}
-    if os.path.exists(ROUTE_TURN_SHADOW_LOG) and os.path.getsize(ROUTE_TURN_SHADOW_LOG) > ROUTE_TURN_SHADOW_MAX:
-      os.replace(ROUTE_TURN_SHADOW_LOG, ROUTE_TURN_SHADOW_LOG + ".1")
-    with open(ROUTE_TURN_SHADOW_LOG, "a") as f:
-      f.write(json.dumps(row) + "\n")
+    sonata_io_write(("append", ROUTE_TURN_SHADOW_LOG, ROUTE_TURN_SHADOW_MAX, row))   # SPRINT36T9_MODELD_IO
   except Exception:
     pass
 
 
 def sonata_carstate_for_desire(cs):
   """Wrap carState for DesireHelper.update; a no-op view when the planner has no active request."""
+  sonata_io_start()   # SPRINT36T9_MODELD_IO
   direction = _REQUEST.active()
   if direction is None:
     side = _TURN.side(cs)   # SPRINT23B_TURN_INTENT
@@ -265,28 +267,29 @@ class SonataRouteDesire:
         self._mtime = st.st_mtime
         with open(self.path) as f:
           s = json.load(f)
-        self.side, self.dist, self.kind = None, None, None
+        side = dist = kind = None   # SPRINT36T9_MODELD_IO: publish once, below
         if isinstance(s, dict) and s.get("status") == "ACTIVE" and isinstance(s.get("gpsAgeS"), (int, float)) and s["gpsAgeS"] <= 3.0:
           m = str(s.get("nextManeuver") or "").lower()
           d = s.get("nextManeuverDistanceM")
           if any(m.startswith(k) for k in P6_MANEUVERS) and isinstance(d, (int, float)) and 0.0 <= d <= P6_KEEP_DIST_M:
             if m.endswith("left") or m.endswith("_slight_left") or "left" in m:
-              self.side = "left"
+              side = "left"
             elif "right" in m:
-              self.side = "right"
-            self.dist = float(d)
-            self.kind = "keep" if self.side else None
+              side = "right"
+            dist = float(d)
+            kind = "keep" if side else None
           elif any(m.startswith(k) for k in P6_TURN_MANEUVERS) and isinstance(d, (int, float)) and 0.0 <= d <= P6_TURN_DIST_M:
             if "left" in m:
-              self.side = "left"
+              side = "left"
             elif "right" in m:
-              self.side = "right"
-            self.dist = float(d)
-            self.kind = "turn" if self.side else None
+              side = "right"
+            dist = float(d)
+            kind = "turn" if side else None
+        self.side, self.dist, self.kind = side, dist, kind
       if self._mtime is not None and time.time() - self._mtime > 4.0:
-        self.side = None; self.kind = None
+        self.side, self.kind = None, None
     except Exception:
-      self.side = None; self.kind = None
+      self.side, self.kind = None, None
 
   def _would(self, dh_desire: int, v_ego: float):
     """(desire to send, gate name) if this hint were enabled; None when nothing applies."""
@@ -308,21 +311,12 @@ class SonataRouteDesire:
              "wouldSend": (would[0] if would else 0), "wouldKind": (would[1] if would else None),
              "sent": int(sent), "keepEnabled": self.enabled, "turnEnabled": self.turn_enabled,
              "repulse": bool(self.repulse_on), "pulses": int(self._pulses)}   # SPRINT35C_KEEP_REPULSE
-      tmp = P6_SHADOW_FILE + ".tmp"
-      with open(tmp, "w") as f:
-        json.dump(row, f)
-      os.replace(tmp, P6_SHADOW_FILE)
+      sonata_io_write(("replace", P6_SHADOW_FILE, 0, row))   # SPRINT36T9_MODELD_IO
       # SPRINT26C_SHADOW_LOG: append history only when gradeable (maneuver in range) or the state changed
       sig = (self.kind, self.side, int(row['wouldSend']), int(sent), self.turn_enabled, self.enabled)
       if self.kind is not None or sig != getattr(self, '_last_sig', None):
         self._last_sig = sig
-        try:
-          if os.path.exists(P6_SHADOW_LOG) and os.path.getsize(P6_SHADOW_LOG) > P6_SHADOW_LOG_MAX:
-            os.replace(P6_SHADOW_LOG, P6_SHADOW_LOG + '.1')
-        except OSError:
-          pass
-        with open(P6_SHADOW_LOG, 'a') as lf:
-          lf.write(json.dumps(row) + '\n')
+        sonata_io_write(("append", P6_SHADOW_LOG, P6_SHADOW_LOG_MAX, row))   # SPRINT36T9_MODELD_IO
     except Exception:
       pass
 
@@ -349,7 +343,8 @@ class SonataRouteDesire:
   def desire(self, dh_desire: int, v_ego: float, now: float | None = None) -> int:
     """The desire to feed the model: the helper's own when it is busy, else keepLeft/keepRight when the route asks."""
     now = time.monotonic() if now is None else now
-    self.poll(now)
+    if not _SONATA_IO["on"]:   # SPRINT36T9_MODELD_IO
+      self.poll(now)
     would = self._would(dh_desire, v_ego)
     sent = int(dh_desire)
     if would is not None:
@@ -365,8 +360,79 @@ class SonataRouteDesire:
 _ROUTE_DESIRE = SonataRouteDesire()
 
 
+# SPRINT36T9_MODELD_IO: every /data read and write for the model loop happens here, never in the loop itself.
+import collections as _sonata_collections
+import threading as _sonata_threading
+SONATA_MODELD_IO_SYNC = "/data/sonata_modeld_io_sync"
+SONATA_IO_TICK_S = 0.05
+_SONATA_IO_Q = _sonata_collections.deque(maxlen=256)   # bounded: a stuck disk drops the oldest rows, never blocks
+
+
+def _sonata_io_do(job):
+  op, path, cap, row = job
+  if op == "replace":
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+      json.dump(row, f)
+    os.replace(tmp, path)
+    return
+  try:
+    if cap and os.path.exists(path) and os.path.getsize(path) > cap:
+      os.replace(path, path + ".1")
+  except OSError:
+    pass
+  with open(path, "a") as f:
+    f.write(json.dumps(row) + "\n")
+
+
+def sonata_io_write(job):
+  """Queue a file write for the background thread; inline only when the thread is off (kill switch)."""
+  if _SONATA_IO["on"]:
+    _SONATA_IO_Q.append(job)
+    return
+  try:
+    _sonata_io_do(job)
+  except Exception:
+    pass
+
+
+def _sonata_io_loop():
+  while True:
+    now = time.monotonic()
+    for poller in (_REQUEST, _TURN, _ROUTE_DESIRE):
+      try:
+        poller.poll(now)
+      except Exception:
+        pass
+    while _SONATA_IO_Q:
+      try:
+        _sonata_io_do(_SONATA_IO_Q.popleft())
+      except Exception:
+        pass
+    time.sleep(SONATA_IO_TICK_S)
+
+
+def sonata_io_start():
+  """Start the I/O thread once, from the model loop (it inherits the loop's CPU and priority and runs only while
+  the loop waits for the next frame). Polls once inline first so the first frames see fresh state."""
+  if _SONATA_IO["started"]:
+    return
+  _SONATA_IO["started"] = True
+  try:
+    if os.path.exists(SONATA_MODELD_IO_SYNC):
+      return
+    now = time.monotonic()
+    for poller in (_REQUEST, _TURN, _ROUTE_DESIRE):
+      poller.poll(now)
+    _sonata_threading.Thread(target=_sonata_io_loop, daemon=True, name="sonata-modeld-io").start()
+    _SONATA_IO["on"] = True
+  except Exception:
+    _SONATA_IO["on"] = False
+
+
 def sonata_route_desire(dh_desire, cs):
   """Wrap DH.desire for the model input (SPRINT21C keep, SPRINT26B turn); no-op unless the matching flag exists."""
+  sonata_io_start()   # SPRINT36T9_MODELD_IO
   try:
     return _ROUTE_DESIRE.desire(int(dh_desire), float(cs.vEgo))
   except Exception:
